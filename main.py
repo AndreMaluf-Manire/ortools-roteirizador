@@ -980,7 +980,7 @@ def recalculate_route_times(request: RecalculateRequest) -> RecalculateResponse:
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.0.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.3.0"}
 
 
 @app.get("/health")
