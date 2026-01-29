@@ -2,18 +2,22 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 6.0 - ROBUSTA:
+VERSÃO 7.0 - COMPLETA:
 - Time Windows como HARD CONSTRAINT no OR-Tools
 - Dimensão de TEMPO (não distância) para otimização
 - Service time incluído na dimensão de tempo
 - Propagação sequencial de tempos após solução
 - Janelas de horário RESPEITADAS na otimização
+- NOVO: Velocidade por veículo (average_speed_kmh)
+- NOVO: Grupos de entregas (delivery_groups)
+- NOVO: Pré-atribuição de entregas (vehicle_id em delivery)
+- NOVO: Endpoint /recalculate para recalcular tempos
 """
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import os
@@ -23,7 +27,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="6.0.0"
+    version="7.0.0"
 )
 
 app.add_middleware(
@@ -70,6 +74,7 @@ class Delivery(BaseModel):
     boxes: float = 0
     weight_kg: float = 0
     value: float = 0
+    vehicle_id: Optional[str] = None  # NOVO: pré-atribuição a veículo
 
 
 class Vehicle(BaseModel):
@@ -77,6 +82,7 @@ class Vehicle(BaseModel):
     name: str
     capacity_boxes: int
     capacity_kg: float = 99999
+    average_speed_kmh: Optional[float] = None  # NOVO: velocidade específica do veículo
 
 
 class OptimizeRequest(BaseModel):
@@ -90,6 +96,7 @@ class OptimizeRequest(BaseModel):
     max_route_duration: int = 720  # 12 horas
     mode: str = "minimize_vehicles"
     average_speed_kmh: float = DEFAULT_SPEED_KMH
+    delivery_groups: Optional[List[List[str]]] = None  # NOVO: grupos de entregas
 
 
 class Stop(BaseModel):
@@ -127,6 +134,7 @@ class Route(BaseModel):
     total_service_time: int = 0
     total_travel_time: int = 0
     capacity_used_percent: float = 0
+    average_speed_kmh: float = DEFAULT_SPEED_KMH  # NOVO: velocidade usada
 
 
 class OptimizeResponse(BaseModel):
@@ -138,6 +146,41 @@ class OptimizeResponse(BaseModel):
     total_deliveries: int
     total_value: float = 0
     optimization_time_ms: int
+
+
+# ============== MODELOS PARA RECÁLCULO ==============
+
+class RecalculateStop(BaseModel):
+    delivery_id: str
+    customer_id: str
+    customer_name: str
+    stop_order: int
+    service_time: int
+    window_start: Optional[int]
+    window_end: Optional[int]
+    boxes: float
+    weight_kg: float
+    value: float = 0
+    lat: float
+    lng: float
+
+
+class RecalculateRequest(BaseModel):
+    depot: Depot
+    stops: List[RecalculateStop]
+    start_time: int = 360
+    average_speed_kmh: float = DEFAULT_SPEED_KMH
+
+
+class RecalculateResponse(BaseModel):
+    success: bool
+    message: str
+    stops: List[Stop]
+    total_time_minutes: int
+    total_distance_km: float
+    total_wait_time: int
+    total_service_time: int
+    total_travel_time: int
 
 
 # ============== FUNÇÕES AUXILIARES ==============
@@ -202,16 +245,32 @@ def create_distance_matrix(locations: List[Location]) -> List[List[float]]:
     return matrix
 
 
+def create_time_matrix_per_vehicle(
+    locations: List[Location], 
+    vehicles: List[Vehicle], 
+    default_speed: float
+) -> Dict[int, List[List[int]]]:
+    """
+    Cria matriz de tempo de viagem para cada veículo (pode ter velocidades diferentes)
+    Retorna um dicionário: vehicle_idx -> time_matrix
+    """
+    matrices = {}
+    for idx, vehicle in enumerate(vehicles):
+        speed = vehicle.average_speed_kmh if vehicle.average_speed_kmh else default_speed
+        matrices[idx] = create_time_matrix(locations, speed)
+    return matrices
+
+
 # ============== SOLVER OR-TOOLS ==============
 
 def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     """
-    VERSÃO 6.0 - VRPTW com Time Windows como HARD CONSTRAINT
+    VERSÃO 7.0 - VRPTW com Time Windows como HARD CONSTRAINT
     
-    1. Cria dimensão de TEMPO com service_time
-    2. Adiciona Time Windows como restrição
-    3. OR-Tools otimiza respeitando janelas
-    4. Recalcula tempos propagados para exibição
+    Novidades v7.0:
+    - Velocidade por veículo
+    - Grupos de entregas (mesmo veículo)
+    - Pré-atribuição de entregas
     """
     start_time_ms = time.time() * 1000
     
@@ -243,9 +302,10 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         else:
             locations.append(request.depot.location)
     
-    # Criar matrizes de tempo e distância
-    speed = request.average_speed_kmh if request.average_speed_kmh > 0 else DEFAULT_SPEED_KMH
-    time_matrix = create_time_matrix(locations, speed)
+    # Velocidade padrão
+    default_speed = request.average_speed_kmh if request.average_speed_kmh > 0 else DEFAULT_SPEED_KMH
+    
+    # Criar matriz de distância (única para todos)
     distance_matrix = create_distance_matrix(locations)
     
     # Service times por nó (depot = 0)
@@ -256,27 +316,23 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         service_times.append(st)
     
     # Time windows por nó
-    # Depot: pode operar o dia todo (ou usar start_time como início)
     time_windows = [(request.start_time, MAX_TIME_HORIZON)]
     
     for delivery in request.deliveries:
         customer = customer_map.get(delivery.customer_id)
         if customer and customer.window_start is not None and customer.window_end is not None:
-            # Janela definida
             time_windows.append((customer.window_start, customer.window_end))
         else:
-            # Sem janela: pode entregar a qualquer hora
             time_windows.append((0, MAX_TIME_HORIZON))
     
-    print(f"\n=== CONFIGURAÇÃO ===")
-    print(f"Velocidade média: {speed} km/h")
+    print(f"\n=== CONFIGURAÇÃO v7.0 ===")
+    print(f"Velocidade padrão: {default_speed} km/h")
     print(f"Horário início: {minutes_to_time(request.start_time)}")
     print(f"Entregas: {len(request.deliveries)}")
     print(f"Veículos disponíveis: {len(request.vehicles)}")
     
     # Configurar veículos
     if request.mode == "minimize_vehicles":
-        # Criar veículos suficientes (até o número de entregas)
         num_vehicles = len(request.deliveries)
         vehicles = []
         for i in range(num_vehicles):
@@ -288,7 +344,8 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                     id=f"extra_{i}",
                     name=f"Veículo Extra {i - len(request.vehicles) + 1}",
                     capacity_boxes=avg_capacity,
-                    capacity_kg=99999
+                    capacity_kg=99999,
+                    average_speed_kmh=default_speed
                 ))
     else:
         num_vehicles = len(request.vehicles)
@@ -306,27 +363,65 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
             optimization_time_ms=int(time.time() * 1000 - start_time_ms)
         )
     
+    # Log velocidades por veículo
+    for idx, v in enumerate(vehicles[:len(request.vehicles)]):
+        speed = v.average_speed_kmh if v.average_speed_kmh else default_speed
+        print(f"  Veículo {v.name}: {speed} km/h")
+    
+    # Criar matrizes de tempo por veículo
+    time_matrices = create_time_matrix_per_vehicle(locations, vehicles, default_speed)
+    
+    # Mapear delivery_id para node_index
+    delivery_id_to_node = {}
+    for idx, delivery in enumerate(request.deliveries):
+        delivery_id_to_node[delivery.id] = idx + 1  # +1 porque depot é 0
+    
+    # Mapear vehicle_id para vehicle_idx
+    vehicle_id_to_idx = {}
+    for idx, vehicle in enumerate(vehicles):
+        vehicle_id_to_idx[vehicle.id] = idx
+    
     # ===== CRIAR MODELO OR-TOOLS =====
     manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
     
-    # ----- CALLBACK DE TEMPO (inclui service time) -----
-    def time_callback(from_index, to_index):
+    # ----- CALLBACKS DE TEMPO POR VEÍCULO -----
+    def make_time_callback(vehicle_idx):
+        time_matrix = time_matrices.get(vehicle_idx, time_matrices[0])
+        def time_callback(from_index, to_index):
+            from_node = manager.IndexToNode(from_index)
+            to_node = manager.IndexToNode(to_index)
+            travel = time_matrix[from_node][to_node]
+            service = service_times[to_node] if to_node > 0 else 0
+            return travel + service
+        return time_callback
+    
+    # Registrar callbacks de tempo para cada veículo
+    time_callback_indices = []
+    for vehicle_idx in range(num_vehicles):
+        callback = make_time_callback(vehicle_idx)
+        callback_index = routing.RegisterTransitCallback(callback)
+        time_callback_indices.append(callback_index)
+    
+    # ----- DIMENSÃO DE TEMPO COM TIME WINDOWS -----
+    # Usar callback do primeiro veículo como base (OR-Tools requer um único callback para dimensão)
+    # Mas vamos usar SetArcCostEvaluatorOfVehicle para custos diferentes
+    base_time_matrix = time_matrices.get(0, create_time_matrix(locations, default_speed))
+    
+    def base_time_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        # Tempo = viagem + service time no destino
-        travel = time_matrix[from_node][to_node]
+        travel = base_time_matrix[from_node][to_node]
         service = service_times[to_node] if to_node > 0 else 0
         return travel + service
     
-    time_callback_index = routing.RegisterTransitCallback(time_callback)
+    base_time_callback_index = routing.RegisterTransitCallback(base_time_callback)
     
-    # ----- DIMENSÃO DE TEMPO COM TIME WINDOWS -----
     routing.AddDimension(
-        time_callback_index,
-        MAX_TIME_HORIZON,  # Slack máximo (permite espera)
+        base_time_callback_index,
+        MAX_TIME_HORIZON,  # Slack máximo
         MAX_TIME_HORIZON,  # Tempo máximo por veículo
-        False,  # Não força início em 0
+        False,
         "Time"
     )
     time_dimension = routing.GetDimensionOrDie("Time")
@@ -354,28 +449,77 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         if from_node == 0:
             return 0
         delivery = request.deliveries[from_node - 1]
-        return int(math.ceil(delivery.boxes))  # Arredondar para cima
+        return int(math.ceil(delivery.boxes))
     
     demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
     
     routing.AddDimensionWithVehicleCapacity(
         demand_callback_index,
-        0,  # Sem slack
+        0,
         [v.capacity_boxes for v in vehicles],
-        True,  # Começa em 0
+        True,
         "Capacity"
     )
     
-    # ----- PENALIDADES E CUSTOS -----
-    # Custo por arco = tempo de viagem (otimiza por tempo total)
-    routing.SetArcCostEvaluatorOfAllVehicles(time_callback_index)
+    # ----- CUSTOS POR VEÍCULO (velocidades diferentes) -----
+    for vehicle_idx in range(num_vehicles):
+        routing.SetArcCostEvaluatorOfVehicle(time_callback_indices[vehicle_idx], vehicle_idx)
     
     # Custo fixo por veículo (para minimizar número de veículos)
     if request.mode == "minimize_vehicles":
         for vehicle_idx in range(num_vehicles):
             routing.SetFixedCostOfVehicle(100000, vehicle_idx)
     
-    # Penalidade alta para entregas não atendidas
+    # ----- PRÉ-ATRIBUIÇÃO DE ENTREGAS (vehicle_id em delivery) -----
+    pre_assigned_count = 0
+    for delivery in request.deliveries:
+        if delivery.vehicle_id and delivery.vehicle_id in vehicle_id_to_idx:
+            node = delivery_id_to_node[delivery.id]
+            vehicle_idx = vehicle_id_to_idx[delivery.vehicle_id]
+            index = manager.NodeToIndex(node)
+            
+            # Forçar que este nó seja atendido por este veículo
+            routing.SetAllowedVehiclesForIndex([vehicle_idx], index)
+            pre_assigned_count += 1
+            
+            customer = customer_map.get(delivery.customer_id)
+            customer_name = customer.name if customer else "?"
+            print(f"  Pré-atribuição: {customer_name} -> {vehicles[vehicle_idx].name}")
+    
+    if pre_assigned_count > 0:
+        print(f"\n  Total pré-atribuições: {pre_assigned_count}")
+    
+    # ----- GRUPOS DE ENTREGAS (delivery_groups) -----
+    if request.delivery_groups:
+        print(f"\n=== GRUPOS DE ENTREGAS ===")
+        for group_idx, group in enumerate(request.delivery_groups):
+            if len(group) < 2:
+                continue
+            
+            # Converter delivery_ids para node indices
+            group_nodes = []
+            for delivery_id in group:
+                if delivery_id in delivery_id_to_node:
+                    group_nodes.append(delivery_id_to_node[delivery_id])
+            
+            if len(group_nodes) < 2:
+                continue
+            
+            print(f"  Grupo {group_idx + 1}: {len(group_nodes)} entregas devem ficar juntas")
+            
+            # Adicionar restrição: todas as entregas do grupo devem ser atendidas pelo mesmo veículo
+            # Usamos PickupAndDelivery como workaround ou Same Vehicle Constraint
+            first_node = group_nodes[0]
+            first_index = manager.NodeToIndex(first_node)
+            
+            for node in group_nodes[1:]:
+                index = manager.NodeToIndex(node)
+                # Restrição: ambos devem estar no mesmo veículo
+                routing.solver().Add(
+                    routing.VehicleVar(first_index) == routing.VehicleVar(index)
+                )
+    
+    # ----- PENALIDADES -----
     penalty = 10000000  # 10 milhões
     for node in range(1, num_locations):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
@@ -388,7 +532,7 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    search_parameters.time_limit.FromSeconds(60)  # Mais tempo para soluções melhores
+    search_parameters.time_limit.FromSeconds(60)
     
     print(f"\n=== RESOLVENDO ===")
     
@@ -422,12 +566,19 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         route_nodes = []
         while not routing.IsEnd(index):
             node = manager.IndexToNode(index)
-            if node > 0:  # Ignorar depot
+            if node > 0:
                 route_nodes.append(node)
             index = solution.Value(routing.NextVar(index))
         
         if not route_nodes:
             continue
+        
+        # Velocidade deste veículo
+        vehicle = vehicles[vehicle_idx] if vehicle_idx < len(vehicles) else None
+        vehicle_speed = vehicle.average_speed_kmh if vehicle and vehicle.average_speed_kmh else default_speed
+        
+        # Matriz de tempo para este veículo
+        time_matrix = time_matrices.get(vehicle_idx, base_time_matrix)
         
         # ===== RECALCULAR TEMPOS DE FORMA PROPAGADA =====
         stops = []
@@ -439,11 +590,10 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         route_service_time = 0
         route_travel_time = 0
         
-        current_time = request.start_time  # Horário atual (departure do ponto anterior)
-        prev_node = 0  # Começa no depot
+        current_time = request.start_time
+        prev_node = 0
         
-        vehicle = vehicles[vehicle_idx] if vehicle_idx < len(vehicles) else None
-        print(f"\n=== ROTA {vehicle_idx + 1}: {vehicle.name if vehicle else 'Extra'} ===")
+        print(f"\n=== ROTA {vehicle_idx + 1}: {vehicle.name if vehicle else 'Extra'} ({vehicle_speed} km/h) ===")
         print(f"Saída do depot: {minutes_to_time(current_time)}")
         
         for stop_order, node in enumerate(route_nodes, 1):
@@ -458,16 +608,15 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
             # Horário de chegada física
             arrival_time = current_time + travel_time
             
-            # Service time deste cliente
+            # Service time
             service_time = service_times[node]
             
             # Janela de tempo
             window_start = time_windows[node][0]
             window_end = time_windows[node][1]
             
-            # Calcular effective_start (quando COMEÇA a entregar)
+            # Calcular effective_start
             if arrival_time < window_start:
-                # Chegou ANTES de abrir - ESPERA
                 effective_start = window_start
                 wait_time = window_start - arrival_time
                 arrived_early = True
@@ -476,14 +625,11 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                 wait_time = 0
                 arrived_early = False
             
-            # Verificar se chegou ATRASADO
             arrived_late = arrival_time > window_end
             window_ok = not arrived_late
             
-            # Horário de saída
             departure_time = effective_start + service_time
             
-            # Log
             print(f"\nPonto {stop_order}: {customer_name}")
             print(f"  Viagem: {travel_time}min ({distance:.1f}km)")
             print(f"  Chegada física: {minutes_to_time(arrival_time)}")
@@ -518,7 +664,6 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                 value=delivery.value
             ))
             
-            # Acumular totais
             route_boxes += delivery.boxes
             route_weight += delivery.weight_kg
             route_value += delivery.value
@@ -527,7 +672,6 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
             route_service_time += service_time
             route_travel_time += travel_time
             
-            # Atualizar para próximo ponto
             current_time = departure_time
             prev_node = node
         
@@ -535,10 +679,8 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         distance_to_depot = distance_matrix[prev_node][0]
         route_distance += distance_to_depot
         
-        # Tempo total
         total_time = stops[-1].departure_time - request.start_time if stops else 0
         
-        # Ocupação
         capacity_used_percent = 0
         if vehicle and vehicle.capacity_boxes > 0:
             capacity_used_percent = round((route_boxes / vehicle.capacity_boxes) * 100, 1)
@@ -558,7 +700,8 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
             total_wait_time=route_wait_time,
             total_service_time=route_service_time,
             total_travel_time=route_travel_time,
-            capacity_used_percent=capacity_used_percent
+            capacity_used_percent=capacity_used_percent,
+            average_speed_kmh=vehicle_speed
         ))
     
     # Entregas não alocadas
@@ -584,11 +727,126 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     )
 
 
+# ============== FUNÇÃO DE RECÁLCULO ==============
+
+def recalculate_route_times(request: RecalculateRequest) -> RecalculateResponse:
+    """
+    Recalcula os tempos de uma rota existente com nova velocidade
+    Não usa OR-Tools, apenas propaga os tempos sequencialmente
+    """
+    if not request.stops:
+        return RecalculateResponse(
+            success=True,
+            message="Nenhuma parada para recalcular",
+            stops=[],
+            total_time_minutes=0,
+            total_distance_km=0,
+            total_wait_time=0,
+            total_service_time=0,
+            total_travel_time=0
+        )
+    
+    speed = request.average_speed_kmh if request.average_speed_kmh > 0 else DEFAULT_SPEED_KMH
+    
+    # Ordenar stops por stop_order
+    sorted_stops = sorted(request.stops, key=lambda s: s.stop_order)
+    
+    # Criar lista de localizações
+    locations = [request.depot.location]
+    for stop in sorted_stops:
+        locations.append(Location(lat=stop.lat, lng=stop.lng))
+    
+    # Criar matrizes
+    time_matrix = create_time_matrix(locations, speed)
+    distance_matrix = create_distance_matrix(locations)
+    
+    # Recalcular tempos
+    result_stops = []
+    current_time = request.start_time
+    prev_node = 0
+    
+    total_distance = 0.0
+    total_wait_time = 0
+    total_service_time = 0
+    total_travel_time = 0
+    
+    for idx, stop in enumerate(sorted_stops):
+        node = idx + 1
+        
+        travel_time = time_matrix[prev_node][node]
+        distance = distance_matrix[prev_node][node]
+        
+        arrival_time = current_time + travel_time
+        
+        window_start = stop.window_start if stop.window_start is not None else 0
+        window_end = stop.window_end if stop.window_end is not None else MAX_TIME_HORIZON
+        
+        if arrival_time < window_start:
+            effective_start = window_start
+            wait_time = window_start - arrival_time
+            arrived_early = True
+        else:
+            effective_start = arrival_time
+            wait_time = 0
+            arrived_early = False
+        
+        arrived_late = arrival_time > window_end
+        window_ok = not arrived_late
+        
+        departure_time = effective_start + stop.service_time
+        
+        result_stops.append(Stop(
+            delivery_id=stop.delivery_id,
+            customer_id=stop.customer_id,
+            customer_name=stop.customer_name,
+            stop_order=stop.stop_order,
+            arrival_time=arrival_time,
+            effective_start=effective_start,
+            departure_time=departure_time,
+            service_time=stop.service_time,
+            wait_time=wait_time,
+            travel_time_from_prev=travel_time,
+            distance_from_prev_km=distance,
+            window_start=stop.window_start,
+            window_end=stop.window_end,
+            window_ok=window_ok,
+            arrived_early=arrived_early,
+            arrived_late=arrived_late,
+            boxes=stop.boxes,
+            weight_kg=stop.weight_kg,
+            value=stop.value
+        ))
+        
+        total_distance += distance
+        total_wait_time += wait_time
+        total_service_time += stop.service_time
+        total_travel_time += travel_time
+        
+        current_time = departure_time
+        prev_node = node
+    
+    # Distância de volta ao depot
+    total_distance += distance_matrix[prev_node][0]
+    
+    total_time = result_stops[-1].departure_time - request.start_time if result_stops else 0
+    
+    return RecalculateResponse(
+        success=True,
+        message=f"Tempos recalculados com velocidade {speed} km/h",
+        stops=result_stops,
+        total_time_minutes=total_time,
+        total_distance_km=round(total_distance, 2),
+        total_wait_time=total_wait_time,
+        total_service_time=total_service_time,
+        total_travel_time=total_travel_time
+    )
+
+
 # ============== ENDPOINTS ==============
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "6.0.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.0.0"}
 
 
 @app.get("/health")
@@ -597,14 +855,17 @@ async def health():
         "status": "healthy",
         "ortools_version": "9.x",
         "api_key_configured": API_KEY != "dev-key-change-in-production",
-        "version": "6.0.0",
+        "version": "7.0.0",
         "features": [
-            "Time Windows as HARD CONSTRAINT (v6.0)",
+            "Time Windows as HARD CONSTRAINT",
             "Time dimension with service_time",
             "Optimizes by total time (not distance)",
             "Sequential time propagation",
             "Wait time when arrived early",
-            "Configurable average_speed_kmh (default 16)",
+            "v7.0: Vehicle-specific average_speed_kmh",
+            "v7.0: Delivery groups (same vehicle)",
+            "v7.0: Pre-assignment (vehicle_id in delivery)",
+            "v7.0: /recalculate endpoint",
             "High penalty for unassigned (10M)",
             "60 second solver timeout",
             "Decimal boxes support"
@@ -652,6 +913,32 @@ async def optimize_routes(
         raise HTTPException(status_code=500, detail=f"Erro na otimização: {str(e)}")
 
 
+@app.post("/recalculate", response_model=RecalculateResponse)
+async def recalculate_route(
+    request: RecalculateRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Recalcula os tempos de uma rota existente com nova velocidade
+    Útil quando o usuário altera a velocidade do veículo
+    """
+    if API_KEY != "dev-key-change-in-production":
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="API Key não fornecida")
+        
+        provided_key = authorization.replace("Bearer ", "")
+        if provided_key != API_KEY:
+            raise HTTPException(status_code=401, detail="API Key inválida")
+    
+    try:
+        result = recalculate_route_times(request)
+        return result
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erro no recálculo: {str(e)}")
+
+
 @app.post("/validate")
 async def validate_request(request: OptimizeRequest):
     issues = []
@@ -669,6 +956,21 @@ async def validate_request(request: OptimizeRequest):
     total_demand = sum(d.boxes for d in request.deliveries)
     total_value = sum(d.value for d in request.deliveries)
     
+    # Verificar pré-atribuições
+    pre_assigned = [d for d in request.deliveries if d.vehicle_id]
+    vehicle_ids = {v.id for v in request.vehicles}
+    for d in pre_assigned:
+        if d.vehicle_id not in vehicle_ids:
+            issues.append(f"Delivery {d.id} pré-atribuída a veículo inexistente: {d.vehicle_id}")
+    
+    # Verificar grupos
+    delivery_ids = {d.id for d in request.deliveries}
+    if request.delivery_groups:
+        for group_idx, group in enumerate(request.delivery_groups):
+            for delivery_id in group:
+                if delivery_id not in delivery_ids:
+                    issues.append(f"Grupo {group_idx + 1} referencia delivery inexistente: {delivery_id}")
+    
     if total_demand > total_capacity and request.mode == "fixed_fleet":
         issues.append(f"Demanda total ({total_demand} caixas) excede capacidade total ({total_capacity} caixas)")
     
@@ -683,7 +985,9 @@ async def validate_request(request: OptimizeRequest):
             "total_boxes": total_demand,
             "total_capacity": total_capacity,
             "total_value": total_value,
-            "average_speed_kmh": request.average_speed_kmh
+            "average_speed_kmh": request.average_speed_kmh,
+            "pre_assigned_deliveries": len(pre_assigned),
+            "delivery_groups": len(request.delivery_groups) if request.delivery_groups else 0
         }
     }
 
