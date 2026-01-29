@@ -2,15 +2,16 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.1 - SOFT TIME WINDOWS:
-- Time Windows como SOFT CONSTRAINT (flexibilidade de 15min)
+VERSÃO 7.2 - PROCESSAMENTO DE REGRAS:
+- Recebe e processa regras de roteamento (fixed_driver, group_by_name)
+- Aplica regras automaticamente antes da otimização
+- Suporta condições: contains, starts_with, equals
+- Vincula freteiros a veículos automaticamente
+- Soft Time Windows (flexibilidade de 15min)
 - Penalidade proporcional por atraso (5000/min)
 - Penalidade aumentada para não-atendimento (100M)
 - Tempo de solução aumentado (120s)
 - Garante 100% de alocação das entregas
-- Minimiza veículos com melhor eficiência
-- Mantém: Velocidade por veículo, grupos, pré-atribuição
-- Mantém: Endpoint /recalculate
 """
 
 from fastapi import FastAPI, HTTPException, Header
@@ -26,7 +27,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.1.0"
+    version="7.2.0"
 )
 
 app.add_middleware(
@@ -70,6 +71,7 @@ class Customer(BaseModel):
 class Delivery(BaseModel):
     id: str
     customer_id: str
+    customer_name: Optional[str] = None  # NOVO: nome do cliente para regras
     boxes: float = 0
     weight_kg: float = 0
     value: float = 0
@@ -82,6 +84,26 @@ class Vehicle(BaseModel):
     capacity_boxes: int
     capacity_kg: float = 99999
     average_speed_kmh: Optional[float] = None  # NOVO: velocidade específica do veículo
+    freteiro_id: Optional[str] = None  # NOVO: ID do freteiro/motorista
+
+
+class RoutingRuleCondition(BaseModel):
+    field: str  # "customer_name"
+    operator: str  # "contains", "starts_with", "equals"
+    value: str
+
+
+class RoutingRuleAction(BaseModel):
+    freteiro_id: Optional[str] = None  # Para fixed_driver
+
+
+class RoutingRule(BaseModel):
+    id: str
+    name: str
+    type: str  # "fixed_driver", "group_by_name"
+    priority: int
+    condition: RoutingRuleCondition
+    action: RoutingRuleAction
 
 
 class OptimizeRequest(BaseModel):
@@ -96,6 +118,7 @@ class OptimizeRequest(BaseModel):
     mode: str = "minimize_vehicles"
     average_speed_kmh: float = DEFAULT_SPEED_KMH
     delivery_groups: Optional[List[List[str]]] = None  # NOVO: grupos de entregas
+    routing_rules: Optional[List[RoutingRule]] = None  # NOVO: regras de roteamento
 
 
 class Stop(BaseModel):
@@ -324,11 +347,91 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         else:
             time_windows.append((0, MAX_TIME_HORIZON))
     
-    print(f"\n=== CONFIGURAÇÃO v7.0 ===")
+    # ===== PROCESSAR REGRAS DE ROTEAMENTO =====
+    print(f"\n=== PROCESSANDO REGRAS DE ROTEAMENTO ===")
+    
+    # Criar mapa de freteiro_id -> vehicle_id
+    freteiro_to_vehicle = {}
+    for vehicle in request.vehicles:
+        if vehicle.freteiro_id:
+            freteiro_to_vehicle[vehicle.freteiro_id] = vehicle.id
+    
+    # Processar regras (ordenadas por prioridade)
+    if request.routing_rules:
+        sorted_rules = sorted(request.routing_rules, key=lambda r: r.priority, reverse=True)
+        
+        for rule in sorted_rules:
+            print(f"\nAplicando regra: {rule.name} (tipo: {rule.type}, prioridade: {rule.priority})")
+            
+            if rule.type == "fixed_driver":
+                # Regra: Atribuir entregas a um motorista específico
+                if not rule.action.freteiro_id:
+                    print(f"  ⚠️ Regra sem freteiro_id, pulando")
+                    continue
+                
+                # Buscar veículo do freteiro
+                vehicle_id = freteiro_to_vehicle.get(rule.action.freteiro_id)
+                if not vehicle_id:
+                    print(f"  ⚠️ Freteiro não encontrado ou sem veículo ativo, pulando")
+                    continue
+                
+                # Aplicar regra a entregas que correspondem à condição
+                matched_count = 0
+                for delivery in request.deliveries:
+                    # Pular se já tem pré-atribuição
+                    if delivery.vehicle_id:
+                        continue
+                    
+                    customer_name = delivery.customer_name or ""
+                    matches = False
+                    
+                    if rule.condition.operator == "contains":
+                        matches = rule.condition.value.lower() in customer_name.lower()
+                    elif rule.condition.operator == "starts_with":
+                        matches = customer_name.lower().startswith(rule.condition.value.lower())
+                    elif rule.condition.operator == "equals":
+                        matches = customer_name.lower() == rule.condition.value.lower()
+                    
+                    if matches:
+                        delivery.vehicle_id = vehicle_id
+                        matched_count += 1
+                        print(f"  ✅ {delivery.customer_name} → veículo {vehicle_id}")
+                
+                print(f"  Total: {matched_count} entregas pré-atribuídas")
+            
+            elif rule.type == "group_by_name":
+                # Regra: Agrupar entregas com nomes similares
+                # Coletar entregas que correspondem
+                group_deliveries = []
+                for delivery in request.deliveries:
+                    customer_name = delivery.customer_name or ""
+                    matches = False
+                    
+                    if rule.condition.operator == "contains":
+                        matches = rule.condition.value.lower() in customer_name.lower()
+                    elif rule.condition.operator == "starts_with":
+                        matches = customer_name.lower().startswith(rule.condition.value.lower())
+                    elif rule.condition.operator == "equals":
+                        matches = customer_name.lower() == rule.condition.value.lower()
+                    
+                    if matches:
+                        group_deliveries.append(delivery.id)
+                
+                if len(group_deliveries) > 1:
+                    # Adicionar ao delivery_groups
+                    if not request.delivery_groups:
+                        request.delivery_groups = []
+                    request.delivery_groups.append(group_deliveries)
+                    print(f"  ✅ Agrupadas {len(group_deliveries)} entregas: {', '.join(group_deliveries[:3])}...")
+    
+    print(f"\n=== CONFIGURAÇÃO v7.1 ===")
     print(f"Velocidade padrão: {default_speed} km/h")
     print(f"Horário início: {minutes_to_time(request.start_time)}")
     print(f"Entregas: {len(request.deliveries)}")
     print(f"Veículos disponíveis: {len(request.vehicles)}")
+    print(f"Regras aplicadas: {len(request.routing_rules) if request.routing_rules else 0}")
+    print(f"Pré-atribuições: {sum(1 for d in request.deliveries if d.vehicle_id)}")
+    print(f"Grupos: {len(request.delivery_groups) if request.delivery_groups else 0}")
     
     # Configurar veículos
     if request.mode == "minimize_vehicles":
