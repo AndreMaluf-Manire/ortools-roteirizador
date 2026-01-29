@@ -8,9 +8,10 @@ Este serviço resolve o problema CVRPTW (Capacitated Vehicle Routing Problem wit
 - Respeita janelas de atendimento dos clientes
 - Garante que todas as entregas sejam alocadas (sem órfãs)
 
-VERSÃO 2.0 - Correções:
-- Cálculo de tempo respeitando janelas (wait_time)
-- Cálculo de distância real (não estimada)
+VERSÃO 3.0 - Correções:
+- Cálculo de tempo PROPAGADO (próxima entrega usa departure anterior)
+- Tempo de atendimento (service_time) de cada cliente
+- Cálculo de distância real usando matriz de tempos ou haversine
 - Campos arrived_early e arrived_late
 - Penalidade aumentada para não deixar órfãs
 """
@@ -27,19 +28,19 @@ import math
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 # CORS para permitir chamadas do Lovable/Supabase
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Em produção, restringir aos domínios do Lovable
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Chave de API para autenticação (configurar no Railway como variável de ambiente)
+# Chave de API para autenticação
 API_KEY = os.getenv("ORTOOLS_API_KEY", "dev-key-change-in-production")
 
 
@@ -82,7 +83,7 @@ class Vehicle(BaseModel):
     id: str
     name: str
     capacity_boxes: int
-    capacity_kg: float = 99999  # Se não informado, ignora peso
+    capacity_kg: float = 99999
 
 
 class OptimizeRequest(BaseModel):
@@ -91,41 +92,48 @@ class OptimizeRequest(BaseModel):
     customers: List[Customer]
     deliveries: List[Delivery]
     vehicles: List[Vehicle]
-    time_matrix: List[List[int]]  # Matriz de tempos em minutos (vem do Distance Matrix)
-    start_time: int = 360         # Horário de início em minutos (default 06:00 = 360)
-    max_route_duration: int = 600 # Duração máxima da rota em minutos (default 10h = 600)
-    mode: str = "minimize_vehicles"  # "minimize_vehicles" ou "fixed_fleet"
+    time_matrix: List[List[int]]  # Matriz de tempos em minutos
+    distance_matrix: Optional[List[List[float]]] = None  # Matriz de distâncias em km (opcional)
+    start_time: int = 360         # Horário de início em minutos (default 06:00)
+    max_route_duration: int = 600 # Duração máxima da rota em minutos (default 10h)
+    mode: str = "minimize_vehicles"
 
 
 class Stop(BaseModel):
-    """Parada na rota otimizada - VERSÃO 2.0 com campos adicionais"""
+    """Parada na rota otimizada - VERSÃO 3.0"""
     delivery_id: str
     customer_id: str
     customer_name: str
     stop_order: int
-    arrival_time: int           # Minutos desde meia-noite - quando o carro CHEGA
-    effective_start: int        # NOVO: Quando COMEÇA a entregar (pode ser diferente se chegou cedo)
-    departure_time: int         # Minutos desde meia-noite - quando o carro SAI
-    wait_time: int = 0          # NOVO: Tempo esperando cliente abrir (minutos)
+    arrival_time: int           # Quando o carro CHEGA
+    effective_start: int        # Quando COMEÇA a entregar
+    departure_time: int         # Quando o carro SAI
+    service_time: int           # Tempo de atendimento usado
+    wait_time: int = 0          # Tempo esperando cliente abrir
+    travel_time_from_prev: int = 0  # Tempo de viagem do ponto anterior
     window_start: Optional[int]
     window_end: Optional[int]
     window_ok: bool
-    arrived_early: bool = False # NOVO: True se chegou antes da janela abrir
-    arrived_late: bool = False  # NOVO: True se chegou depois da janela fechar
+    arrived_early: bool = False
+    arrived_late: bool = False
     boxes: int
     weight_kg: float
+    distance_from_prev_km: float = 0  # Distância do ponto anterior
 
 
 class Route(BaseModel):
     """Rota otimizada para um veículo"""
-    vehicle_id: Optional[str]  # None se for rota extra (pool)
+    vehicle_id: Optional[str]
     vehicle_name: Optional[str]
     stops: List[Stop]
     total_boxes: int
     total_weight_kg: float
     total_time_minutes: int
-    total_distance_km: float    # RENOMEADO: Distância real em km
-    total_wait_time: int = 0    # NOVO: Tempo total de espera na rota
+    total_distance_km: float
+    total_wait_time: int = 0
+    total_service_time: int = 0
+    total_travel_time: int = 0
+    capacity_used_percent: float = 0  # Percentual de ocupação
 
 
 class OptimizeResponse(BaseModel):
@@ -133,7 +141,7 @@ class OptimizeResponse(BaseModel):
     success: bool
     message: str
     routes: List[Route]
-    unassigned_deliveries: List[str]  # IDs das entregas não alocadas (se houver)
+    unassigned_deliveries: List[str]
     vehicles_used: int
     total_deliveries: int
     optimization_time_ms: int
@@ -141,24 +149,9 @@ class OptimizeResponse(BaseModel):
 
 # ============== FUNÇÕES AUXILIARES ==============
 
-def time_to_minutes(time_str: str) -> int:
-    """Converte HH:MM para minutos desde meia-noite"""
-    if not time_str:
-        return 0
-    parts = time_str.split(":")
-    return int(parts[0]) * 60 + int(parts[1])
-
-
-def minutes_to_time(minutes: int) -> str:
-    """Converte minutos desde meia-noite para HH:MM"""
-    hours = minutes // 60
-    mins = minutes % 60
-    return f"{hours:02d}:{mins:02d}"
-
-
 def haversine_distance(loc1: Location, loc2: Location) -> float:
     """Calcula distância em km entre dois pontos"""
-    R = 6371  # Raio da Terra em km
+    R = 6371
     lat1, lon1 = math.radians(loc1.lat), math.radians(loc1.lng)
     lat2, lon2 = math.radians(loc2.lat), math.radians(loc2.lng)
     
@@ -172,7 +165,7 @@ def haversine_distance(loc1: Location, loc2: Location) -> float:
 
 
 def get_location_for_node(node: int, request: 'OptimizeRequest', customer_map: dict) -> Location:
-    """Retorna a localização de um nó (depot ou entrega)"""
+    """Retorna a localização de um nó"""
     if node == 0:
         return request.depot.location
     else:
@@ -181,30 +174,46 @@ def get_location_for_node(node: int, request: 'OptimizeRequest', customer_map: d
         return customer.location if customer else request.depot.location
 
 
+def get_travel_time(from_node: int, to_node: int, request: 'OptimizeRequest', customer_map: dict) -> int:
+    """Retorna tempo de viagem entre dois nós"""
+    if request.time_matrix and len(request.time_matrix) > from_node and len(request.time_matrix[from_node]) > to_node:
+        return request.time_matrix[from_node][to_node]
+    
+    # Fallback: estimar baseado em distância
+    loc1 = get_location_for_node(from_node, request, customer_map)
+    loc2 = get_location_for_node(to_node, request, customer_map)
+    distance_km = haversine_distance(loc1, loc2)
+    return int(distance_km / 30 * 60)  # 30 km/h média
+
+
+def get_distance(from_node: int, to_node: int, request: 'OptimizeRequest', customer_map: dict) -> float:
+    """Retorna distância em km entre dois nós"""
+    if request.distance_matrix and len(request.distance_matrix) > from_node and len(request.distance_matrix[from_node]) > to_node:
+        return request.distance_matrix[from_node][to_node]
+    
+    # Fallback: calcular com haversine
+    loc1 = get_location_for_node(from_node, request, customer_map)
+    loc2 = get_location_for_node(to_node, request, customer_map)
+    return haversine_distance(loc1, loc2)
+
+
 # ============== SOLVER OR-TOOLS ==============
 
 def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     """
     Resolve o problema CVRPTW usando OR-Tools.
     
-    Estratégia:
-    1. Se mode="minimize_vehicles": usa veículos virtuais ilimitados e minimiza quantidade
-    2. Se mode="fixed_fleet": usa apenas os veículos informados
-    
-    VERSÃO 2.0:
-    - Calcula tempo de espera quando carro chega antes da janela
-    - Calcula distância real usando haversine
-    - Retorna campos arrived_early e arrived_late
+    VERSÃO 3.0:
+    - Calcula tempo de forma PROPAGADA (usa departure do ponto anterior)
+    - Usa service_time de cada cliente
+    - Calcula distância real
     """
     import time
     start_time_ms = time.time() * 1000
     
-    # Mapear customers e deliveries
     customer_map = {c.id: c for c in request.customers}
     delivery_map = {d.id: d for d in request.deliveries}
     
-    # Criar lista de nós: [depot] + [deliveries]
-    # Índice 0 = depot, índices 1..N = entregas
     nodes = ["depot"] + [d.id for d in request.deliveries]
     num_locations = len(nodes)
     
@@ -221,14 +230,12 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     
     # Número de veículos
     if request.mode == "minimize_vehicles":
-        # Criar veículos virtuais suficientes (máximo = número de entregas)
         num_vehicles = len(request.deliveries)
         vehicles = []
         for i in range(num_vehicles):
             if i < len(request.vehicles):
                 vehicles.append(request.vehicles[i])
             else:
-                # Veículo virtual com capacidade média
                 avg_capacity = sum(v.capacity_boxes for v in request.vehicles) // len(request.vehicles) if request.vehicles else 100
                 vehicles.append(Vehicle(
                     id=f"extra_{i}",
@@ -251,62 +258,56 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
             optimization_time_ms=int(time.time() * 1000 - start_time_ms)
         )
     
-    # Criar o gerenciador de índices
     manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, 0)
-    
-    # Criar o modelo de roteamento
     routing = pywrapcp.RoutingModel(manager)
     
-    # ===== CALLBACK DE TEMPO/DISTÂNCIA =====
+    # ===== CALLBACK DE TEMPO (inclui service_time) =====
     def time_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
         
-        # Usar matriz de tempos se disponível
-        if request.time_matrix and len(request.time_matrix) > from_node and len(request.time_matrix[from_node]) > to_node:
-            return request.time_matrix[from_node][to_node]
+        # Tempo de viagem
+        travel_time = get_travel_time(from_node, to_node, request, customer_map)
         
-        # Fallback: estimar tempo baseado em distância (30 km/h média em SP)
-        loc1 = get_location_for_node(from_node, request, customer_map)
-        loc2 = get_location_for_node(to_node, request, customer_map)
+        # Adicionar tempo de serviço do nó de origem (exceto depot)
+        service_time = 0
+        if from_node > 0:
+            delivery = request.deliveries[from_node - 1]
+            customer = customer_map.get(delivery.customer_id)
+            service_time = customer.service_time if customer else 15
         
-        distance_km = haversine_distance(loc1, loc2)
-        time_minutes = int(distance_km / 30 * 60)  # 30 km/h
-        return time_minutes
+        return travel_time + service_time
     
     transit_callback_index = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
     
-    # ===== DIMENSÃO DE TEMPO (para janelas) =====
+    # ===== DIMENSÃO DE TEMPO =====
     routing.AddDimension(
         transit_callback_index,
-        120,  # Slack máximo aumentado para 2h (espera permitida)
-        request.max_route_duration,  # Tempo máximo por rota
-        False,  # Não forçar início no tempo 0
+        240,  # Slack máximo 4h (para espera em janelas)
+        request.max_route_duration + 240,  # Tempo máximo + slack
+        False,
         "Time"
     )
     time_dimension = routing.GetDimensionOrDie("Time")
     
-    # Configurar janelas de tempo para cada nó
+    # Configurar janelas de tempo
     for location_idx in range(num_locations):
         if location_idx == 0:
-            # Depot: janela ampla
             index = manager.NodeToIndex(location_idx)
             time_dimension.CumulVar(index).SetRange(0, request.max_route_duration)
         else:
-            # Entrega: usar janela do cliente
             delivery = request.deliveries[location_idx - 1]
             customer = customer_map.get(delivery.customer_id)
             
             index = manager.NodeToIndex(location_idx)
             
             if customer and customer.window_start is not None and customer.window_end is not None:
-                # Converter para minutos relativos ao início da rota
+                # Janela relativa ao início da rota
                 window_start = max(0, customer.window_start - request.start_time)
-                window_end = max(window_start, customer.window_end - request.start_time)
+                window_end = max(window_start + 60, customer.window_end - request.start_time + 60)  # +60 de tolerância
                 time_dimension.CumulVar(index).SetRange(window_start, window_end)
             else:
-                # Sem janela: qualquer horário
                 time_dimension.CumulVar(index).SetRange(0, request.max_route_duration)
     
     # ===== DIMENSÃO DE CAPACIDADE =====
@@ -320,21 +321,19 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
     routing.AddDimensionWithVehicleCapacity(
         demand_callback_index,
-        0,  # Sem slack
-        [v.capacity_boxes for v in vehicles],  # Capacidade por veículo
-        True,  # Começar do zero
+        0,
+        [v.capacity_boxes for v in vehicles],
+        True,
         "Capacity"
     )
     
-    # ===== PENALIDADE PARA VEÍCULOS NÃO USADOS (minimizar frota) =====
+    # ===== PENALIDADES =====
     if request.mode == "minimize_vehicles":
-        # Alta penalidade por usar veículo adicional
         for vehicle_idx in range(num_vehicles):
             routing.SetFixedCostOfVehicle(10000, vehicle_idx)
     
-    # ===== PERMITIR ENTREGAS NÃO ATENDIDAS (com penalidade MUITO alta) =====
-    # CORREÇÃO V2: Penalidade aumentada para forçar alocação de todas as entregas
-    penalty = 1000000  # Penalidade MUITO alta por não entregar
+    # Penalidade MUITO alta por não entregar
+    penalty = 1000000
     for node in range(1, num_locations):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
     
@@ -346,7 +345,7 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    search_parameters.time_limit.FromSeconds(30)  # Limite de 30 segundos
+    search_parameters.time_limit.FromSeconds(30)
     
     # ===== RESOLVER =====
     solution = routing.SolveWithParameters(search_parameters)
@@ -354,7 +353,7 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     if not solution:
         return OptimizeResponse(
             success=False,
-            message="Não foi possível encontrar uma solução. Verifique se as janelas e capacidades são compatíveis.",
+            message="Não foi possível encontrar uma solução. Verifique janelas e capacidades.",
             routes=[],
             unassigned_deliveries=[d.id for d in request.deliveries],
             vehicles_used=0,
@@ -362,117 +361,137 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
             optimization_time_ms=int(time.time() * 1000 - start_time_ms)
         )
     
-    # ===== EXTRAIR SOLUÇÃO (VERSÃO 2.0 com wait_time e distância real) =====
+    # ===== EXTRAIR SOLUÇÃO (VERSÃO 3.0 - PROPAGAÇÃO CORRETA) =====
     routes = []
-    unassigned = []
     vehicles_used = 0
     
     for vehicle_idx in range(num_vehicles):
         index = routing.Start(vehicle_idx)
+        
+        # Primeiro, coletar a sequência de nós
+        route_nodes = []
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            if node > 0:
+                route_nodes.append(node)
+            index = solution.Value(routing.NextVar(index))
+        
+        if not route_nodes:
+            continue
+        
+        # Agora, calcular tempos de forma PROPAGADA
         stops = []
         route_boxes = 0
         route_weight = 0
-        route_distance = 0.0  # NOVO: Distância real
-        route_wait_time = 0   # NOVO: Tempo total de espera
-        stop_order = 0
-        prev_node = 0  # Começa no depot
+        route_distance = 0.0
+        route_wait_time = 0
+        route_service_time = 0
+        route_travel_time = 0
         
-        # Variável para rastrear o horário de partida do ponto anterior
-        prev_departure = request.start_time
+        # Começar do depot no horário de início
+        current_time = request.start_time
+        prev_node = 0  # depot
         
-        while not routing.IsEnd(index):
-            node = manager.IndexToNode(index)
+        for stop_order, node in enumerate(route_nodes, 1):
+            delivery = request.deliveries[node - 1]
+            customer = customer_map.get(delivery.customer_id)
             
-            if node > 0:  # Não é o depot
-                delivery = request.deliveries[node - 1]
-                customer = customer_map.get(delivery.customer_id)
-                
-                # NOVO: Calcular distância do ponto anterior
-                if prev_node != node:
-                    loc1 = get_location_for_node(prev_node, request, customer_map)
-                    loc2 = get_location_for_node(node, request, customer_map)
-                    route_distance += haversine_distance(loc1, loc2)
-                
-                time_var = time_dimension.CumulVar(index)
-                arrival = solution.Min(time_var) + request.start_time
-                service_time = customer.service_time if customer else 15
-                
-                # ===== CORREÇÃO V2: Calcular tempo efetivo considerando janela =====
-                effective_start = arrival
-                wait_time = 0
-                arrived_early = False
-                arrived_late = False
-                
-                if customer and customer.window_start is not None:
-                    if arrival < customer.window_start:
-                        # Chegou antes de abrir - precisa esperar
-                        effective_start = customer.window_start
-                        wait_time = customer.window_start - arrival
-                        arrived_early = True
-                    elif customer.window_end is not None and arrival > customer.window_end:
-                        # Chegou depois de fechar - problema!
-                        arrived_late = True
-                
-                # Calcular horário de partida baseado no início efetivo
-                departure = effective_start + service_time
-                
-                # Verificar se está dentro da janela
-                window_ok = True
-                if customer and customer.window_start is not None and customer.window_end is not None:
-                    window_ok = customer.window_start <= arrival <= customer.window_end
-                
-                stop_order += 1
-                stops.append(Stop(
-                    delivery_id=delivery.id,
-                    customer_id=delivery.customer_id,
-                    customer_name=customer.name if customer else "Desconhecido",
-                    stop_order=stop_order,
-                    arrival_time=arrival,
-                    effective_start=effective_start,  # NOVO
-                    departure_time=departure,
-                    wait_time=wait_time,              # NOVO
-                    window_start=customer.window_start if customer else None,
-                    window_end=customer.window_end if customer else None,
-                    window_ok=window_ok,
-                    arrived_early=arrived_early,      # NOVO
-                    arrived_late=arrived_late,        # NOVO
-                    boxes=delivery.boxes,
-                    weight_kg=delivery.weight_kg
-                ))
-                
-                route_boxes += delivery.boxes
-                route_weight += delivery.weight_kg
-                route_wait_time += wait_time
-                prev_departure = departure
+            # Calcular tempo de viagem do ponto anterior
+            travel_time = get_travel_time(prev_node, node, request, customer_map)
+            distance = get_distance(prev_node, node, request, customer_map)
             
+            # Horário de chegada = horário atual + tempo de viagem
+            arrival_time = current_time + travel_time
+            
+            # Tempo de serviço deste cliente
+            service_time = customer.service_time if customer else 15
+            
+            # Verificar janela e calcular espera
+            wait_time = 0
+            arrived_early = False
+            arrived_late = False
+            effective_start = arrival_time
+            
+            if customer and customer.window_start is not None:
+                if arrival_time < customer.window_start:
+                    # Chegou antes de abrir - ESPERA até abrir
+                    wait_time = customer.window_start - arrival_time
+                    effective_start = customer.window_start
+                    arrived_early = True
+                elif customer.window_end is not None and arrival_time > customer.window_end:
+                    # Chegou depois de fechar
+                    arrived_late = True
+            
+            # Horário de partida = início efetivo + tempo de serviço
+            departure_time = effective_start + service_time
+            
+            # Verificar se está dentro da janela
+            window_ok = True
+            if customer and customer.window_start is not None and customer.window_end is not None:
+                # Considera OK se chegou dentro da janela (mesmo que cedo e esperou)
+                window_ok = not arrived_late
+            
+            stops.append(Stop(
+                delivery_id=delivery.id,
+                customer_id=delivery.customer_id,
+                customer_name=customer.name if customer else "Desconhecido",
+                stop_order=stop_order,
+                arrival_time=arrival_time,
+                effective_start=effective_start,
+                departure_time=departure_time,
+                service_time=service_time,
+                wait_time=wait_time,
+                travel_time_from_prev=travel_time,
+                window_start=customer.window_start if customer else None,
+                window_end=customer.window_end if customer else None,
+                window_ok=window_ok,
+                arrived_early=arrived_early,
+                arrived_late=arrived_late,
+                boxes=delivery.boxes,
+                weight_kg=delivery.weight_kg,
+                distance_from_prev_km=round(distance, 2)
+            ))
+            
+            # Acumular totais
+            route_boxes += delivery.boxes
+            route_weight += delivery.weight_kg
+            route_distance += distance
+            route_wait_time += wait_time
+            route_service_time += service_time
+            route_travel_time += travel_time
+            
+            # ATUALIZAR horário atual para o PRÓXIMO ponto
+            # O próximo ponto começa a partir do departure deste
+            current_time = departure_time
             prev_node = node
-            index = solution.Value(routing.NextVar(index))
         
         # Adicionar distância de volta ao depot
-        if stops:
-            loc1 = get_location_for_node(prev_node, request, customer_map)
-            loc2 = request.depot.location
-            route_distance += haversine_distance(loc1, loc2)
+        distance_to_depot = get_distance(prev_node, 0, request, customer_map)
+        route_distance += distance_to_depot
         
-        if stops:
-            vehicles_used += 1
-            vehicle = vehicles[vehicle_idx] if vehicle_idx < len(vehicles) else None
-            
-            # Calcular tempo total da rota
-            first_arrival = stops[0].arrival_time
-            last_departure = stops[-1].departure_time
-            total_time = last_departure - first_arrival
-            
-            routes.append(Route(
-                vehicle_id=vehicle.id if vehicle and not vehicle.id.startswith("extra_") else None,
-                vehicle_name=vehicle.name if vehicle else f"Rota Extra {vehicle_idx + 1}",
-                stops=stops,
-                total_boxes=route_boxes,
-                total_weight_kg=route_weight,
-                total_time_minutes=total_time,
-                total_distance_km=round(route_distance, 2),  # CORREÇÃO: Distância real
-                total_wait_time=route_wait_time              # NOVO
-            ))
+        # Tempo total da rota
+        total_time = stops[-1].departure_time - request.start_time if stops else 0
+        
+        # Calcular ocupação
+        vehicle = vehicles[vehicle_idx] if vehicle_idx < len(vehicles) else None
+        capacity_used_percent = 0
+        if vehicle and vehicle.capacity_boxes > 0:
+            capacity_used_percent = round((route_boxes / vehicle.capacity_boxes) * 100, 1)
+        
+        vehicles_used += 1
+        routes.append(Route(
+            vehicle_id=vehicle.id if vehicle and not vehicle.id.startswith("extra_") else None,
+            vehicle_name=vehicle.name if vehicle else f"Rota Extra {vehicle_idx + 1}",
+            stops=stops,
+            total_boxes=route_boxes,
+            total_weight_kg=round(route_weight, 2),
+            total_time_minutes=total_time,
+            total_distance_km=round(route_distance, 2),
+            total_wait_time=route_wait_time,
+            total_service_time=route_service_time,
+            total_travel_time=route_travel_time,
+            capacity_used_percent=capacity_used_percent
+        ))
     
     # Identificar entregas não alocadas
     assigned_deliveries = set()
@@ -498,7 +517,7 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
 @app.get("/")
 async def root():
     """Health check"""
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "2.0.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "3.0.0"}
 
 
 @app.get("/health")
@@ -508,11 +527,14 @@ async def health():
         "status": "healthy",
         "ortools_version": "9.x",
         "api_key_configured": API_KEY != "dev-key-change-in-production",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "features": [
-            "wait_time calculation",
-            "real distance (haversine)",
+            "propagated time calculation",
+            "service_time per customer",
+            "wait_time when arrived early",
+            "real distance (haversine or matrix)",
             "arrived_early/arrived_late flags",
+            "capacity_used_percent",
             "increased penalty for unassigned"
         ]
     }
@@ -526,21 +548,11 @@ async def optimize_routes(
     """
     Otimiza rotas usando OR-Tools CVRPTW.
     
-    Recebe:
-    - depot: Base de origem
-    - customers: Lista de clientes com janelas
-    - deliveries: Entregas a serem alocadas
-    - vehicles: Veículos disponíveis
-    - time_matrix: Matriz de tempos (do Google Distance Matrix)
-    - mode: "minimize_vehicles" ou "fixed_fleet"
-    
-    Retorna:
-    - routes: Lista de rotas otimizadas
-    - unassigned_deliveries: Entregas não alocadas (se houver)
-    
-    VERSÃO 2.0:
-    - Cada stop inclui: effective_start, wait_time, arrived_early, arrived_late
-    - Cada route inclui: total_distance_km (real), total_wait_time
+    VERSÃO 3.0:
+    - Tempo PROPAGADO: próxima entrega usa departure da anterior
+    - service_time de cada cliente
+    - wait_time quando chega antes de abrir
+    - Distância real (matriz ou haversine)
     """
     
     # Validar API Key
@@ -552,7 +564,6 @@ async def optimize_routes(
         if provided_key != API_KEY:
             raise HTTPException(status_code=401, detail="API Key inválida")
     
-    # Validar dados mínimos
     if not request.deliveries:
         return OptimizeResponse(
             success=True,
@@ -570,7 +581,6 @@ async def optimize_routes(
             detail="Modo 'fixed_fleet' requer pelo menos um veículo"
         )
     
-    # Executar otimização
     try:
         result = solve_vrptw(request)
         return result
@@ -580,31 +590,25 @@ async def optimize_routes(
 
 @app.post("/validate")
 async def validate_request(request: OptimizeRequest):
-    """
-    Valida os dados antes de otimizar (útil para debug).
-    """
+    """Valida os dados antes de otimizar."""
     issues = []
     
-    # Verificar se todos os customers das deliveries existem
     customer_ids = {c.id for c in request.customers}
     for d in request.deliveries:
         if d.customer_id not in customer_ids:
             issues.append(f"Delivery {d.id} referencia customer inexistente: {d.customer_id}")
     
-    # Verificar se há coordenadas válidas
     for c in request.customers:
         if not (-90 <= c.location.lat <= 90) or not (-180 <= c.location.lng <= 180):
             issues.append(f"Customer {c.id} tem coordenadas inválidas")
     
-    # Verificar capacidade total vs demanda total
     total_capacity = sum(v.capacity_boxes for v in request.vehicles) if request.vehicles else 0
     total_demand = sum(d.boxes for d in request.deliveries)
     
     if total_demand > total_capacity and request.mode == "fixed_fleet":
         issues.append(f"Demanda total ({total_demand} caixas) excede capacidade total ({total_capacity} caixas)")
     
-    # Verificar matriz de tempos
-    expected_size = len(request.deliveries) + 1  # depot + deliveries
+    expected_size = len(request.deliveries) + 1
     if request.time_matrix:
         if len(request.time_matrix) != expected_size:
             issues.append(f"Matriz de tempos tem tamanho incorreto: {len(request.time_matrix)} vs esperado {expected_size}")
@@ -619,7 +623,8 @@ async def validate_request(request: OptimizeRequest):
             "vehicles": len(request.vehicles),
             "total_boxes": total_demand,
             "total_capacity": total_capacity,
-            "has_time_matrix": bool(request.time_matrix)
+            "has_time_matrix": bool(request.time_matrix),
+            "has_distance_matrix": bool(request.distance_matrix)
         }
     }
 
@@ -628,3 +633,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
+Fechar
