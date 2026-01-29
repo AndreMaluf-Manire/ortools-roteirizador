@@ -2,14 +2,14 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.3 - DEBUG E CORREÇÃO DE REGRAS:
+VERSÃO 7.4.0 - NOVAS REGRAS DE ROTEAMENTO:
+- vehicle_exclusive_for_group: Veículo(s) exclusivo(s) para grupo específico
+- force_multiple_vehicles: Forçar distribuição em múltiplos veículos
+- fixed_driver com múltiplos veículos (vehicle_ids em action)
+- Distribuição balanceada (round-robin) ou sequencial
+- Restrições de exclusividade via SetAllowedVehiclesForIndex
 - Logs detalhados de processamento de regras
-- Mostra condições e ações de cada regra
-- Contador de regras aplicadas com sucesso
-- Validação de action.freteiro_id
-- Alerta quando nenhuma entrega corresponde à condição
 - Soft Time Windows (flexibilidade de 15min)
-- Penalidade proporcional por atraso (5000/min)
 - Penalidade aumentada para não-atendimento (100M)
 - Tempo de solução aumentado (120s)
 - Garante 100% de alocação das entregas
@@ -28,7 +28,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.3.0"
+    version="7.4.0"
 )
 
 app.add_middleware(
@@ -96,15 +96,18 @@ class RoutingRuleCondition(BaseModel):
 
 class RoutingRuleAction(BaseModel):
     freteiro_id: Optional[str] = None  # Para fixed_driver
+    vehicle_ids: Optional[List[str]] = None  # Para vehicle_exclusive_for_group, force_multiple_vehicles, fixed_driver com múltiplos veículos
+    distribution_mode: Optional[str] = None  # Para force_multiple_vehicles: "balanced" ou "sequential"
 
 
 class RoutingRule(BaseModel):
     id: str
     name: str
-    type: str  # "fixed_driver", "group_by_name"
+    type: str  # "fixed_driver", "group_by_name", "vehicle_exclusive_for_group", "force_multiple_vehicles"
     priority: int
     condition: RoutingRuleCondition
     action: RoutingRuleAction
+    vehicle_ids: Optional[List[str]] = None  # Para vehicle_exclusive_for_group e force_multiple_vehicles
 
 
 class OptimizeRequest(BaseModel):
@@ -374,17 +377,25 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                     print(f"  ⚠️ Regra sem freteiro_id (action={rule.action}), pulando")
                     continue
                 
-                print(f"  Buscando veículo do freteiro: {rule.action.freteiro_id}")
+                print(f"  Buscando veículo(s) do freteiro: {rule.action.freteiro_id}")
                 rules_applied_count += 1
                 
-                # Buscar veículo do freteiro
-                vehicle_id = freteiro_to_vehicle.get(rule.action.freteiro_id)
-                if not vehicle_id:
-                    print(f"  ⚠️ Freteiro não encontrado ou sem veículo ativo, pulando")
-                    continue
+                # Verificar se há vehicle_ids específicos na ação
+                target_vehicle_ids = []
+                if rule.action.vehicle_ids and len(rule.action.vehicle_ids) > 0:
+                    # Usar veículos específicos da ação
+                    target_vehicle_ids = rule.action.vehicle_ids
+                    print(f"  Usando {len(target_vehicle_ids)} veículo(s) específico(s)")
+                else:
+                    # Buscar veículo do freteiro (comportamento original)
+                    vehicle_id = freteiro_to_vehicle.get(rule.action.freteiro_id)
+                    if not vehicle_id:
+                        print(f"  ⚠️ Freteiro não encontrado ou sem veículo ativo, pulando")
+                        continue
+                    target_vehicle_ids = [vehicle_id]
                 
-                # Aplicar regra a entregas que correspondem à condição
-                matched_count = 0
+                # Coletar entregas que correspondem à condição
+                matched_deliveries = []
                 for delivery in request.deliveries:
                     # Pular se já tem pré-atribuição
                     if delivery.vehicle_id:
@@ -401,12 +412,24 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                         matches = customer_name.lower() == rule.condition.value.lower()
                     
                     if matches:
+                        matched_deliveries.append(delivery)
+                
+                # Distribuir entregas entre os veículos (round-robin se múltiplos)
+                if len(target_vehicle_ids) == 1:
+                    # Um único veículo: atribuir todas
+                    for delivery in matched_deliveries:
+                        delivery.vehicle_id = target_vehicle_ids[0]
+                        print(f"  ✅ {delivery.customer_name} → veículo {target_vehicle_ids[0]}")
+                else:
+                    # Múltiplos veículos: distribuir balanceado
+                    for idx, delivery in enumerate(matched_deliveries):
+                        vehicle_idx = idx % len(target_vehicle_ids)
+                        vehicle_id = target_vehicle_ids[vehicle_idx]
                         delivery.vehicle_id = vehicle_id
-                        matched_count += 1
                         print(f"  ✅ {delivery.customer_name} → veículo {vehicle_id}")
                 
-                print(f"  Total: {matched_count} entregas pré-atribuídas")
-                if matched_count == 0:
+                print(f"  Total: {len(matched_deliveries)} entregas pré-atribuídas")
+                if len(matched_deliveries) == 0:
                     print(f"  ⚠️ Nenhuma entrega correspondeu à condição!")
             
             elif rule.type == "group_by_name":
@@ -436,6 +459,102 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                     rules_applied_count += 1
                 else:
                     print(f"  ⚠️ Apenas {len(group_deliveries)} entrega(s) encontrada(s), não há o que agrupar")
+            
+            elif rule.type == "vehicle_exclusive_for_group":
+                # Regra: Veículo(s) só aceita(m) entregas de um grupo específico
+                if not rule.vehicle_ids or len(rule.vehicle_ids) == 0:
+                    print(f"  ⚠️ Regra sem vehicle_ids, pulando")
+                    continue
+                
+                print(f"  Veículos exclusivos: {rule.vehicle_ids}")
+                rules_applied_count += 1
+                
+                # Marcar quais entregas correspondem à condição
+                allowed_delivery_ids = set()
+                for delivery in request.deliveries:
+                    customer_name = delivery.customer_name or ""
+                    matches = False
+                    
+                    if rule.condition.operator == "contains":
+                        matches = rule.condition.value.lower() in customer_name.lower()
+                    elif rule.condition.operator == "starts_with":
+                        matches = customer_name.lower().startswith(rule.condition.value.lower())
+                    elif rule.condition.operator == "equals":
+                        matches = customer_name.lower() == rule.condition.value.lower()
+                    
+                    if matches:
+                        allowed_delivery_ids.add(delivery.id)
+                
+                print(f"  Entregas permitidas: {len(allowed_delivery_ids)}")
+                
+                # Armazenar restrição para aplicar depois (após criar o modelo OR-Tools)
+                # Vamos adicionar um campo temporário no request
+                if not hasattr(request, 'vehicle_exclusive_rules'):
+                    request.vehicle_exclusive_rules = []
+                request.vehicle_exclusive_rules.append({
+                    'vehicle_ids': rule.vehicle_ids,
+                    'allowed_delivery_ids': allowed_delivery_ids
+                })
+            
+            elif rule.type == "force_multiple_vehicles":
+                # Regra: Forçar distribuição de grupo em múltiplos veículos específicos
+                if not rule.vehicle_ids or len(rule.vehicle_ids) < 2:
+                    print(f"  ⚠️ Regra requer pelo menos 2 veículos, pulando")
+                    continue
+                
+                print(f"  Forçar distribuição em {len(rule.vehicle_ids)} veículos")
+                rules_applied_count += 1
+                
+                # Coletar entregas que correspondem à condição
+                matched_deliveries = []
+                for delivery in request.deliveries:
+                    customer_name = delivery.customer_name or ""
+                    matches = False
+                    
+                    if rule.condition.operator == "contains":
+                        matches = rule.condition.value.lower() in customer_name.lower()
+                    elif rule.condition.operator == "starts_with":
+                        matches = customer_name.lower().startswith(rule.condition.value.lower())
+                    elif rule.condition.operator == "equals":
+                        matches = customer_name.lower() == rule.condition.value.lower()
+                    
+                    if matches:
+                        matched_deliveries.append(delivery)
+                
+                if len(matched_deliveries) < len(rule.vehicle_ids):
+                    print(f"  ⚠️ Apenas {len(matched_deliveries)} entrega(s), menos que {len(rule.vehicle_ids)} veículos")
+                    continue
+                
+                print(f"  Distribuindo {len(matched_deliveries)} entregas em {len(rule.vehicle_ids)} veículos")
+                
+                # Modo de distribuição
+                distribution_mode = rule.action.distribution_mode if rule.action and rule.action.distribution_mode else "balanced"
+                
+                if distribution_mode == "balanced":
+                    # Distribuir de forma balanceada (round-robin)
+                    for idx, delivery in enumerate(matched_deliveries):
+                        vehicle_idx = idx % len(rule.vehicle_ids)
+                        vehicle_id = rule.vehicle_ids[vehicle_idx]
+                        
+                        # Pular se já tem pré-atribuição
+                        if not delivery.vehicle_id:
+                            delivery.vehicle_id = vehicle_id
+                            print(f"    ✅ {delivery.customer_name} -> {vehicle_id}")
+                else:
+                    # Modo sequential: preencher primeiro veículo, depois segundo, etc.
+                    deliveries_per_vehicle = len(matched_deliveries) // len(rule.vehicle_ids)
+                    remainder = len(matched_deliveries) % len(rule.vehicle_ids)
+                    
+                    delivery_idx = 0
+                    for vehicle_idx, vehicle_id in enumerate(rule.vehicle_ids):
+                        count = deliveries_per_vehicle + (1 if vehicle_idx < remainder else 0)
+                        for _ in range(count):
+                            if delivery_idx < len(matched_deliveries):
+                                delivery = matched_deliveries[delivery_idx]
+                                if not delivery.vehicle_id:
+                                    delivery.vehicle_id = vehicle_id
+                                    print(f"    ✅ {delivery.customer_name} -> {vehicle_id}")
+                                delivery_idx += 1
     else:
         print("Nenhuma regra recebida no payload")
     
@@ -647,6 +766,49 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                 routing.solver().Add(
                     routing.VehicleVar(first_index) == routing.VehicleVar(index)
                 )
+    
+    # ----- RESTRIÇÕES DE EXCLUSIVIDADE DE VEÍCULO -----
+    if hasattr(request, 'vehicle_exclusive_rules'):
+        print(f"\n=== RESTRIÇÕES DE EXCLUSIVIDADE ===")
+        for rule_idx, rule_data in enumerate(request.vehicle_exclusive_rules):
+            vehicle_ids = rule_data['vehicle_ids']
+            allowed_delivery_ids = rule_data['allowed_delivery_ids']
+            
+            # Converter vehicle_ids para vehicle_indices
+            exclusive_vehicle_indices = []
+            for vid in vehicle_ids:
+                if vid in vehicle_id_to_idx:
+                    exclusive_vehicle_indices.append(vehicle_id_to_idx[vid])
+            
+            if not exclusive_vehicle_indices:
+                print(f"  Regra {rule_idx + 1}: Veículos não encontrados, pulando")
+                continue
+            
+            print(f"  Regra {rule_idx + 1}: {len(exclusive_vehicle_indices)} veículo(s) exclusivo(s) para {len(allowed_delivery_ids)} entrega(s)")
+            
+            # Para cada entrega:
+            # - Se está na lista permitida: só pode ser atendida pelos veículos exclusivos
+            # - Se NÃO está na lista: NÃO pode ser atendida pelos veículos exclusivos
+            for delivery in request.deliveries:
+                node = delivery_id_to_node[delivery.id]
+                index = manager.NodeToIndex(node)
+                
+                # Pular se já tem pré-atribuição
+                if delivery.vehicle_id:
+                    continue
+                
+                if delivery.id in allowed_delivery_ids:
+                    # Entrega permitida: só pode usar estes veículos
+                    routing.SetAllowedVehiclesForIndex(exclusive_vehicle_indices, index)
+                    customer = customer_map.get(delivery.customer_id)
+                    customer_name = customer.name if customer else "?"
+                    print(f"    ✅ {customer_name} -> apenas veículos {vehicle_ids}")
+                else:
+                    # Entrega NÃO permitida: proibir estes veículos
+                    # Criar lista de veículos permitidos (todos EXCETO os exclusivos)
+                    allowed_vehicles = [i for i in range(num_vehicles) if i not in exclusive_vehicle_indices]
+                    if allowed_vehicles:
+                        routing.SetAllowedVehiclesForIndex(allowed_vehicles, index)
     
     # ----- PENALIDADES -----
     # Penalidade MUITO ALTA para não-atendimento (100M)
