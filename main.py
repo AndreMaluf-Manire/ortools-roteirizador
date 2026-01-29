@@ -2,11 +2,12 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.2 - PROCESSAMENTO DE REGRAS:
-- Recebe e processa regras de roteamento (fixed_driver, group_by_name)
-- Aplica regras automaticamente antes da otimização
-- Suporta condições: contains, starts_with, equals
-- Vincula freteiros a veículos automaticamente
+VERSÃO 7.3 - DEBUG E CORREÇÃO DE REGRAS:
+- Logs detalhados de processamento de regras
+- Mostra condições e ações de cada regra
+- Contador de regras aplicadas com sucesso
+- Validação de action.freteiro_id
+- Alerta quando nenhuma entrega corresponde à condição
 - Soft Time Windows (flexibilidade de 15min)
 - Penalidade proporcional por atraso (5000/min)
 - Penalidade aumentada para não-atendimento (100M)
@@ -27,7 +28,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.2.0"
+    version="7.3.0"
 )
 
 app.add_middleware(
@@ -357,17 +358,24 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
             freteiro_to_vehicle[vehicle.freteiro_id] = vehicle.id
     
     # Processar regras (ordenadas por prioridade)
+    rules_applied_count = 0
     if request.routing_rules:
         sorted_rules = sorted(request.routing_rules, key=lambda r: r.priority, reverse=True)
+        print(f"Total de regras recebidas: {len(sorted_rules)}")
         
         for rule in sorted_rules:
             print(f"\nAplicando regra: {rule.name} (tipo: {rule.type}, prioridade: {rule.priority})")
+            print(f"  Condição: {rule.condition.field} {rule.condition.operator} '{rule.condition.value}'")
+            print(f"  Ação: {rule.action}")
             
             if rule.type == "fixed_driver":
                 # Regra: Atribuir entregas a um motorista específico
-                if not rule.action.freteiro_id:
-                    print(f"  ⚠️ Regra sem freteiro_id, pulando")
+                if not rule.action or not rule.action.freteiro_id:
+                    print(f"  ⚠️ Regra sem freteiro_id (action={rule.action}), pulando")
                     continue
+                
+                print(f"  Buscando veículo do freteiro: {rule.action.freteiro_id}")
+                rules_applied_count += 1
                 
                 # Buscar veículo do freteiro
                 vehicle_id = freteiro_to_vehicle.get(rule.action.freteiro_id)
@@ -398,6 +406,8 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                         print(f"  ✅ {delivery.customer_name} → veículo {vehicle_id}")
                 
                 print(f"  Total: {matched_count} entregas pré-atribuídas")
+                if matched_count == 0:
+                    print(f"  ⚠️ Nenhuma entrega correspondeu à condição!")
             
             elif rule.type == "group_by_name":
                 # Regra: Agrupar entregas com nomes similares
@@ -423,13 +433,19 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                         request.delivery_groups = []
                     request.delivery_groups.append(group_deliveries)
                     print(f"  ✅ Agrupadas {len(group_deliveries)} entregas: {', '.join(group_deliveries[:3])}...")
+                    rules_applied_count += 1
+                else:
+                    print(f"  ⚠️ Apenas {len(group_deliveries)} entrega(s) encontrada(s), não há o que agrupar")
+    else:
+        print("Nenhuma regra recebida no payload")
     
-    print(f"\n=== CONFIGURAÇÃO v7.1 ===")
+    print(f"\n=== CONFIGURAÇÃO v7.3 ===")
     print(f"Velocidade padrão: {default_speed} km/h")
     print(f"Horário início: {minutes_to_time(request.start_time)}")
     print(f"Entregas: {len(request.deliveries)}")
     print(f"Veículos disponíveis: {len(request.vehicles)}")
-    print(f"Regras aplicadas: {len(request.routing_rules) if request.routing_rules else 0}")
+    print(f"Regras recebidas: {len(request.routing_rules) if request.routing_rules else 0}")
+    print(f"Regras aplicadas com sucesso: {rules_applied_count}")
     print(f"Pré-atribuições: {sum(1 for d in request.deliveries if d.vehicle_id)}")
     print(f"Grupos: {len(request.delivery_groups) if request.delivery_groups else 0}")
     
