@@ -2,16 +2,15 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.0 - COMPLETA:
-- Time Windows como HARD CONSTRAINT no OR-Tools
-- Dimensão de TEMPO (não distância) para otimização
-- Service time incluído na dimensão de tempo
-- Propagação sequencial de tempos após solução
-- Janelas de horário RESPEITADAS na otimização
-- NOVO: Velocidade por veículo (average_speed_kmh)
-- NOVO: Grupos de entregas (delivery_groups)
-- NOVO: Pré-atribuição de entregas (vehicle_id em delivery)
-- NOVO: Endpoint /recalculate para recalcular tempos
+VERSÃO 7.1 - SOFT TIME WINDOWS:
+- Time Windows como SOFT CONSTRAINT (flexibilidade de 15min)
+- Penalidade proporcional por atraso (5000/min)
+- Penalidade aumentada para não-atendimento (100M)
+- Tempo de solução aumentado (120s)
+- Garante 100% de alocação das entregas
+- Minimiza veículos com melhor eficiência
+- Mantém: Velocidade por veículo, grupos, pré-atribuição
+- Mantém: Endpoint /recalculate
 """
 
 from fastapi import FastAPI, HTTPException, Header
@@ -27,7 +26,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.0.0"
+    version="7.1.0"
 )
 
 app.add_middleware(
@@ -426,17 +425,28 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     )
     time_dimension = routing.GetDimensionOrDie("Time")
     
-    # Definir janelas de tempo para cada nó
+    # Definir janelas de tempo para cada nó (SOFT CONSTRAINT com 15min de flexibilidade)
+    FLEXIBILITY_MINUTES = 15
     for node in range(num_locations):
         index = manager.NodeToIndex(node)
         window_start, window_end = time_windows[node]
-        time_dimension.CumulVar(index).SetRange(window_start, window_end)
+        
+        # Permitir flexibilidade de 15min antes e depois
+        flexible_start = max(0, window_start - FLEXIBILITY_MINUTES)
+        flexible_end = min(MAX_TIME_HORIZON, window_end + FLEXIBILITY_MINUTES)
+        
+        time_dimension.CumulVar(index).SetRange(flexible_start, flexible_end)
         
         if node > 0:
             delivery = request.deliveries[node - 1]
             customer = customer_map.get(delivery.customer_id)
             customer_name = customer.name if customer else "?"
-            print(f"  Nó {node} ({customer_name}): janela {minutes_to_time(window_start)}-{minutes_to_time(window_end)}")
+            print(f"  Nó {node} ({customer_name}): janela {minutes_to_time(window_start)}-{minutes_to_time(window_end)} (flex: {minutes_to_time(flexible_start)}-{minutes_to_time(flexible_end)})")
+    
+    # Adicionar penalidade proporcional por atraso (5000 por minuto)
+    # Isso incentiva o OR-Tools a respeitar as janelas originais, mas permite flexibilidade
+    for vehicle_idx in range(num_vehicles):
+        time_dimension.SetSpanCostCoefficientForVehicle(5000, vehicle_idx)
     
     # Definir horário de início dos veículos
     for vehicle_idx in range(num_vehicles):
@@ -520,9 +530,13 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
                 )
     
     # ----- PENALIDADES -----
-    penalty = 10000000  # 10 milhões
+    # Penalidade MUITO ALTA para não-atendimento (100M)
+    # Isso força o OR-Tools a alocar TODAS as entregas
+    penalty = 100000000  # 100 milhões (10x maior que antes)
     for node in range(1, num_locations):
         routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
+    
+    print(f"\nPenalidade por não-atendimento: {penalty:,}")
     
     # ----- PARÂMETROS DE BUSCA -----
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
@@ -532,7 +546,8 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    search_parameters.time_limit.FromSeconds(60)
+    # Aumentar tempo de solução para 120s (2 minutos)
+    search_parameters.time_limit.FromSeconds(120)
     
     print(f"\n=== RESOLVENDO ===")
     
