@@ -2,7 +2,7 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.6.0 - GARANTIA DE 100% DE ALOCAÇÃO:
+VERSÃO 7.6.1 - GARANTIA DE 100% DE ALOCAÇÃO:
 - Penalidade EXTREMA para não-atendimento (10 trilhões)
 - Tempo de solução aumentado para 300s (5 minutos)
 - Prioridade absoluta: alocar TODAS as entregas
@@ -20,7 +20,7 @@ VERSÃO 7.4.0 - NOVAS REGRAS DE ROTEAMENTO:
 - fixed_driver com múltiplos veículos (vehicle_ids em action)
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -33,7 +33,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.6.0"
+    version="7.6.1"
 )
 
 app.add_middleware(
@@ -44,14 +44,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.getenv("ORTOOLS_API_KEY", "dev-key-change-in-production")
+# API aberta - sem autenticação
 
 # Constantes
 DEFAULT_SPEED_KMH = 16.0
 MAX_TIME_HORIZON = 1440  # 24 horas em minutos
 DEFAULT_SERVICE_TIME = 15
 
-# v7.6.0: Penalidade EXTREMA para garantir 100% de alocação
+# v7.6.1: Penalidade EXTREMA para garantir 100% de alocação
 PENALTY_UNASSIGNED = 10_000_000_000_000  # 10 trilhões
 SOLUTION_TIME_LIMIT = 300  # 5 minutos
 FLEXIBILITY_MINUTES = 30  # Flexibilidade de janela aumentada
@@ -240,15 +240,13 @@ def create_distance_matrix(locations: List[Location]) -> List[List[float]]:
 # ============== OTIMIZAÇÃO ==============
 
 @app.post("/optimize", response_model=OptimizeResponse)
-async def optimize_routes(request: OptimizeRequest, x_api_key: str = Header(None)):
+async def optimize_routes(request: OptimizeRequest):
     start_time_ms = time.time() * 1000
     
-    # Validar API key
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    # API aberta - sem validação de API key
     
     print(f"\n{'='*60}")
-    print(f"=== OTIMIZAÇÃO v7.6.0 - GARANTIA 100% ALOCAÇÃO ===")
+    print(f"=== OTIMIZAÇÃO v7.6.1 - GARANTIA 100% ALOCAÇÃO ===")
     print(f"{'='*60}")
     print(f"Depot: {request.depot.name}")
     print(f"Entregas: {len(request.deliveries)}")
@@ -447,7 +445,7 @@ async def optimize_routes(request: OptimizeRequest, x_api_key: str = Header(None
         print(f"\nRegras aplicadas: {rules_applied_count}")
     
     # ===== CONFIGURAR VEÍCULOS =====
-    # v7.6.0: USAR APENAS VEÍCULOS REAIS - sem veículos extras!
+    # v7.6.1: USAR APENAS VEÍCULOS REAIS - sem veículos extras!
     num_vehicles = len(request.vehicles)
     vehicles = list(request.vehicles)
     
@@ -526,7 +524,7 @@ async def optimize_routes(request: OptimizeRequest, x_api_key: str = Header(None
     )
     time_dimension = routing.GetDimensionOrDie("Time")
     
-    # v7.6.0: Janelas de tempo mais flexíveis (30min)
+    # v7.6.1: Janelas de tempo mais flexíveis (30min)
     print(f"\n=== JANELAS DE TEMPO (flexibilidade: {FLEXIBILITY_MINUTES}min) ===")
     for node in range(num_locations):
         index = manager.NodeToIndex(node)
@@ -568,7 +566,7 @@ async def optimize_routes(request: OptimizeRequest, x_api_key: str = Header(None
     for vehicle_idx in range(num_vehicles):
         routing.SetArcCostEvaluatorOfVehicle(time_callback_indices[vehicle_idx], vehicle_idx)
     
-    # v7.6.0: Custo fixo MENOR para não penalizar uso de mais veículos
+    # v7.6.1: Custo fixo MENOR para não penalizar uso de mais veículos
     # Prioridade é alocar TODAS as entregas, não minimizar veículos
     for vehicle_idx in range(num_vehicles):
         routing.SetFixedCostOfVehicle(1000, vehicle_idx)  # Custo baixo
@@ -668,7 +666,7 @@ async def optimize_routes(request: OptimizeRequest, x_api_key: str = Header(None
                     if allowed_vehicles:
                         routing.SetAllowedVehiclesForIndex(allowed_vehicles, index)
     
-    # ----- PENALIDADES v7.6.0 -----
+    # ----- PENALIDADES v7.6.1 -----
     # Penalidade EXTREMA para garantir 100% de alocação
     print(f"\n=== PENALIDADES ===")
     print(f"Penalidade por não-atendimento: {PENALTY_UNASSIGNED:,}")
@@ -676,7 +674,7 @@ async def optimize_routes(request: OptimizeRequest, x_api_key: str = Header(None
     for node in range(1, num_locations):
         routing.AddDisjunction([manager.NodeToIndex(node)], PENALTY_UNASSIGNED)
     
-    # ----- PARÂMETROS DE BUSCA v7.6.0 -----
+    # ----- PARÂMETROS DE BUSCA v7.6.1 -----
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -873,12 +871,12 @@ async def optimize_routes(request: OptimizeRequest, x_api_key: str = Header(None
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.6.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.6.1"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "7.6.0"}
+    return {"status": "healthy", "version": "7.6.1"}
 
 
 
