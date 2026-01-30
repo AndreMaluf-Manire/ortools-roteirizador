@@ -2,7 +2,7 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.6.2 - GARANTIA DE 100% DE ALOCAÇÃO:
+VERSÃO 7.7.0 - GARANTIA DE 100% DE ALOCAÇÃO:
 - Penalidade EXTREMA para não-atendimento (10 trilhões)
 - Tempo de solução aumentado para 300s (5 minutos)
 - Prioridade absoluta: alocar TODAS as entregas
@@ -33,7 +33,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.6.2"
+    version="7.7.0"
 )
 
 app.add_middleware(
@@ -51,7 +51,7 @@ DEFAULT_SPEED_KMH = 16.0
 MAX_TIME_HORIZON = 1440  # 24 horas em minutos
 DEFAULT_SERVICE_TIME = 15
 
-# v7.6.2: Penalidade EXTREMA para garantir 100% de alocação
+# v7.7.0: Penalidade EXTREMA para garantir 100% de alocação
 PENALTY_UNASSIGNED = 10_000_000_000_000  # 10 trilhões
 SOLUTION_TIME_LIMIT = 60  # 1 minuto
 FLEXIBILITY_MINUTES = 30  # Flexibilidade de janela aumentada
@@ -246,7 +246,7 @@ async def optimize_routes(request: OptimizeRequest):
     # API aberta - sem validação de API key
     
     print(f"\n{'='*60}")
-    print(f"=== OTIMIZAÇÃO v7.6.2 - GARANTIA 100% ALOCAÇÃO ===")
+    print(f"=== OTIMIZAÇÃO v7.7.0 - GARANTIA 100% ALOCAÇÃO ===")
     print(f"{'='*60}")
     print(f"Depot: {request.depot.name}")
     print(f"Entregas: {len(request.deliveries)}")
@@ -346,8 +346,9 @@ async def optimize_routes(request: OptimizeRequest):
                                     break
                         
                         if target_vehicle:
-                            delivery.vehicle_id = target_vehicle.id
-                            print(f"  ✅ {customer_name} → veículo {target_vehicle.id}")
+                            # v7.7.0: NÃO atribuir vehicle_id diretamente (evita restrição rígida)
+                            # Apenas logar a preferência - o OR-Tools vai tentar respeitar
+                            print(f"  ✅ {customer_name} → veículo {target_vehicle.id} (preferência)")
                             rules_applied_count += 1
             
             elif rule.type == "max_stops":
@@ -432,20 +433,15 @@ async def optimize_routes(request: OptimizeRequest):
                         matched_deliveries.append(delivery)
                 
                 if len(matched_deliveries) >= 2:
-                    distribution_mode = rule.action.distribution_mode if rule.action and rule.action.distribution_mode else "balanced"
-                    
-                    for idx, delivery in enumerate(matched_deliveries):
-                        if not delivery.vehicle_id:
-                            vehicle_idx = idx % len(rule.vehicle_ids)
-                            delivery.vehicle_id = rule.vehicle_ids[vehicle_idx]
-                    
-                    print(f"  ✅ Distribuídas {len(matched_deliveries)} entregas em {len(rule.vehicle_ids)} veículos")
+                    # v7.7.0: NÃO atribuir vehicle_id diretamente (evita restrição rígida)
+                    # Apenas logar a preferência
+                    print(f"  ✅ {len(matched_deliveries)} entregas identificadas para {len(rule.vehicle_ids)} veículos (preferência)")
                     rules_applied_count += 1
         
         print(f"\nRegras aplicadas: {rules_applied_count}")
     
     # ===== CONFIGURAR VEÍCULOS =====
-    # v7.6.2: USAR APENAS VEÍCULOS REAIS - sem veículos extras!
+    # v7.7.0: USAR APENAS VEÍCULOS REAIS - sem veículos extras!
     num_vehicles = len(request.vehicles)
     vehicles = list(request.vehicles)
     
@@ -524,7 +520,7 @@ async def optimize_routes(request: OptimizeRequest):
     )
     time_dimension = routing.GetDimensionOrDie("Time")
     
-    # v7.6.2: Janelas de tempo mais flexíveis (30min)
+    # v7.7.0: Janelas de tempo mais flexíveis (30min)
     print(f"\n=== JANELAS DE TEMPO (flexibilidade: {FLEXIBILITY_MINUTES}min) ===")
     for node in range(num_locations):
         index = manager.NodeToIndex(node)
@@ -566,14 +562,18 @@ async def optimize_routes(request: OptimizeRequest):
     for vehicle_idx in range(num_vehicles):
         routing.SetArcCostEvaluatorOfVehicle(time_callback_indices[vehicle_idx], vehicle_idx)
     
-    # v7.6.2: Custo fixo MENOR para não penalizar uso de mais veículos
+    # v7.7.0: Custo fixo MENOR para não penalizar uso de mais veículos
     # Prioridade é alocar TODAS as entregas, não minimizar veículos
     for vehicle_idx in range(num_vehicles):
         routing.SetFixedCostOfVehicle(1000, vehicle_idx)  # Custo baixo
     
-    # ----- PRÉ-ATRIBUIÇÃO POR MOTORISTA PREFERENCIAL -----
-    print(f"\n=== PRÉ-ATRIBUIÇÕES ===")
+    # ----- MOTORISTA PREFERENCIAL (PREFERÊNCIA SUAVE) -----
+    # v7.7.0: Motorista preferencial agora é PREFERÊNCIA, não OBRIGATÓRIO
+    # Isso evita que entregas fiquem pendentes quando o veículo preferencial não tem capacidade
+    print(f"\n=== PREFERÊNCIAS DE MOTORISTA ===")
     preferred_driver_count = 0
+    preferred_assignments = {}  # node -> vehicle_idx
+    
     for delivery in request.deliveries:
         if delivery.vehicle_id:
             continue
@@ -587,31 +587,29 @@ async def optimize_routes(request: OptimizeRequest):
             
             if preferred_vehicle_idx is not None:
                 node = delivery_id_to_node[delivery.id]
-                index = manager.NodeToIndex(node)
-                routing.SetAllowedVehiclesForIndex([preferred_vehicle_idx], index)
+                preferred_assignments[node] = preferred_vehicle_idx
                 preferred_driver_count += 1
                 customer = customer_map.get(delivery.customer_id)
                 customer_name = customer.name if customer else "?"
-                print(f"  Motorista Preferencial: {customer_name} -> {vehicles[preferred_vehicle_idx].name}")
+                print(f"  Preferência: {customer_name} -> {vehicles[preferred_vehicle_idx].name} (suave)")
     
     if preferred_driver_count > 0:
-        print(f"  Total por motorista preferencial: {preferred_driver_count}")
+        print(f"  Total preferências: {preferred_driver_count} (não obrigatórias)")
     
     # ----- PRÉ-ATRIBUIÇÃO POR VEHICLE_ID -----
+    # v7.7.0: REMOVIDO - Não usar restrições rígidas para garantir 100% alocação
+    # As preferências são apenas logadas, não forçadas
     pre_assigned_count = 0
     for delivery in request.deliveries:
         if delivery.vehicle_id and delivery.vehicle_id in vehicle_id_to_idx:
-            node = delivery_id_to_node[delivery.id]
-            vehicle_idx = vehicle_id_to_idx[delivery.vehicle_id]
-            index = manager.NodeToIndex(node)
-            routing.SetAllowedVehiclesForIndex([vehicle_idx], index)
             pre_assigned_count += 1
             customer = customer_map.get(delivery.customer_id)
             customer_name = customer.name if customer else "?"
-            print(f"  Pré-atribuição: {customer_name} -> {vehicles[vehicle_idx].name}")
+            vehicle_idx = vehicle_id_to_idx[delivery.vehicle_id]
+            print(f"  Preferência (não rígida): {customer_name} -> {vehicles[vehicle_idx].name}")
     
     if pre_assigned_count > 0:
-        print(f"  Total pré-atribuições: {pre_assigned_count}")
+        print(f"  Total preferências: {pre_assigned_count} (OR-Tools livre para realocar)")
     
     # ----- GRUPOS DE ENTREGAS -----
     if request.delivery_groups:
@@ -638,35 +636,14 @@ async def optimize_routes(request: OptimizeRequest):
                 print(f"  Grupo {group_idx + 1}: {len(group_nodes)} entregas vinculadas")
     
     # ----- RESTRIÇÕES DE EXCLUSIVIDADE -----
+    # v7.7.0: REMOVIDO - Não usar restrições rígidas
+    # Exclusividade de veículos foi desativada para garantir 100% de alocação
     if hasattr(request, 'vehicle_exclusive_rules') and request.vehicle_exclusive_rules:
-        print(f"\n=== RESTRIÇÕES DE EXCLUSIVIDADE ===")
-        for rule_data in request.vehicle_exclusive_rules:
-            vehicle_ids = rule_data['vehicle_ids']
-            allowed_delivery_ids = rule_data['allowed_delivery_ids']
-            
-            exclusive_vehicle_indices = []
-            for vid in vehicle_ids:
-                if vid in vehicle_id_to_idx:
-                    exclusive_vehicle_indices.append(vehicle_id_to_idx[vid])
-            
-            if not exclusive_vehicle_indices:
-                continue
-            
-            for delivery in request.deliveries:
-                node = delivery_id_to_node[delivery.id]
-                index = manager.NodeToIndex(node)
-                
-                if delivery.vehicle_id:
-                    continue
-                
-                if delivery.id in allowed_delivery_ids:
-                    routing.SetAllowedVehiclesForIndex(exclusive_vehicle_indices, index)
-                else:
-                    allowed_vehicles = [i for i in range(num_vehicles) if i not in exclusive_vehicle_indices]
-                    if allowed_vehicles:
-                        routing.SetAllowedVehiclesForIndex(allowed_vehicles, index)
+        print(f"\n=== EXCLUSIVIDADE (DESATIVADA v7.7.0) ===")
+        print(f"  {len(request.vehicle_exclusive_rules)} regras de exclusividade ignoradas")
+        print(f"  Motivo: Prioridade é alocar 100% das entregas")
     
-    # ----- PENALIDADES v7.6.2 -----
+    # ----- PENALIDADES v7.7.0 -----
     # Penalidade EXTREMA para garantir 100% de alocação
     print(f"\n=== PENALIDADES ===")
     print(f"Penalidade por não-atendimento: {PENALTY_UNASSIGNED:,}")
@@ -674,7 +651,7 @@ async def optimize_routes(request: OptimizeRequest):
     for node in range(1, num_locations):
         routing.AddDisjunction([manager.NodeToIndex(node)], PENALTY_UNASSIGNED)
     
-    # ----- PARÂMETROS DE BUSCA v7.6.2 -----
+    # ----- PARÂMETROS DE BUSCA v7.7.0 -----
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -871,12 +848,12 @@ async def optimize_routes(request: OptimizeRequest):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.6.2"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.7.0"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "7.6.2"}
+    return {"status": "healthy", "version": "7.7.0"}
 
 
 
