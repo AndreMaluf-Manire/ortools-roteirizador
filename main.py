@@ -2,7 +2,7 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.7.0 - GARANTIA DE 100% DE ALOCAÇÃO:
+VERSÃO 7.8.0 - GARANTIA DE 100% DE ALOCAÇÃO:
 - Penalidade EXTREMA para não-atendimento (10 trilhões)
 - Tempo de solução aumentado para 300s (5 minutos)
 - Prioridade absoluta: alocar TODAS as entregas
@@ -33,7 +33,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.7.0"
+    version="7.8.0"
 )
 
 app.add_middleware(
@@ -51,10 +51,18 @@ DEFAULT_SPEED_KMH = 16.0
 MAX_TIME_HORIZON = 1440  # 24 horas em minutos
 DEFAULT_SERVICE_TIME = 15
 
-# v7.7.0: Penalidade EXTREMA para garantir 100% de alocação
+# v7.8.0: Penalidade EXTREMA para garantir 100% de alocação
 PENALTY_UNASSIGNED = 10_000_000_000_000  # 10 trilhões
 SOLUTION_TIME_LIMIT = 60  # 1 minuto
-FLEXIBILITY_MINUTES = 30  # Flexibilidade de janela aumentada
+FLEXIBILITY_MINUTES = 30  # Flexibilidade de janela
+
+# v7.8.0: HARDCODE - Vivenda sempre nos 2 carros do Marcelo Mota
+# Esses veículos são EXCLUSIVOS para entregas com "VIVENDA" no nome
+VIVENDA_VEHICLE_IDS = [
+    "a70ac53e-e466-4aac-8c98-07d5148f7e02",  # FIORINO (Marcelo Mota)
+    "5668e45f-bf68-40d7-b387-2c8d2e90a2c3",  # FIORINO EDU (Marcelo Mota)
+]
+VIVENDA_KEYWORD = "vivenda"  # Palavra-chave para identificar entregas Vivenda
 
 
 # ============== MODELOS DE DADOS ==============
@@ -246,7 +254,7 @@ async def optimize_routes(request: OptimizeRequest):
     # API aberta - sem validação de API key
     
     print(f"\n{'='*60}")
-    print(f"=== OTIMIZAÇÃO v7.7.0 - GARANTIA 100% ALOCAÇÃO ===")
+    print(f"=== OTIMIZAÇÃO v7.8.0 - GARANTIA 100% ALOCAÇÃO ===")
     print(f"{'='*60}")
     print(f"Depot: {request.depot.name}")
     print(f"Entregas: {len(request.deliveries)}")
@@ -346,7 +354,7 @@ async def optimize_routes(request: OptimizeRequest):
                                     break
                         
                         if target_vehicle:
-                            # v7.7.0: NÃO atribuir vehicle_id diretamente (evita restrição rígida)
+                            # v7.8.0: NÃO atribuir vehicle_id diretamente (evita restrição rígida)
                             # Apenas logar a preferência - o OR-Tools vai tentar respeitar
                             print(f"  ✅ {customer_name} → veículo {target_vehicle.id} (preferência)")
                             rules_applied_count += 1
@@ -433,15 +441,44 @@ async def optimize_routes(request: OptimizeRequest):
                         matched_deliveries.append(delivery)
                 
                 if len(matched_deliveries) >= 2:
-                    # v7.7.0: NÃO atribuir vehicle_id diretamente (evita restrição rígida)
+                    # v7.8.0: NÃO atribuir vehicle_id diretamente (evita restrição rígida)
                     # Apenas logar a preferência
                     print(f"  ✅ {len(matched_deliveries)} entregas identificadas para {len(rule.vehicle_ids)} veículos (preferência)")
                     rules_applied_count += 1
         
         print(f"\nRegras aplicadas: {rules_applied_count}")
     
+    # ===== v7.8.0: HARDCODE VIVENDA/MARCELO MOTA =====
+    # Identificar entregas Vivenda e distribuí-las nos 2 FIORINOs
+    print(f"\n=== HARDCODE VIVENDA (v7.8.0) ===")
+    vivenda_deliveries = []
+    non_vivenda_deliveries = []
+    
+    for delivery in request.deliveries:
+        customer_name = (delivery.customer_name or "").lower()
+        if VIVENDA_KEYWORD in customer_name:
+            vivenda_deliveries.append(delivery)
+        else:
+            non_vivenda_deliveries.append(delivery)
+    
+    print(f"  Entregas VIVENDA encontradas: {len(vivenda_deliveries)}")
+    print(f"  Entregas NÃO-VIVENDA: {len(non_vivenda_deliveries)}")
+    
+    # Distribuir Vivendas entre os 2 veículos (round-robin)
+    vivenda_assigned = 0
+    for idx, delivery in enumerate(vivenda_deliveries):
+        vehicle_idx = idx % len(VIVENDA_VEHICLE_IDS)
+        delivery.vehicle_id = VIVENDA_VEHICLE_IDS[vehicle_idx]
+        vivenda_assigned += 1
+        print(f"    {delivery.customer_name} -> Veículo {vehicle_idx + 1} (FIORINO)")
+    
+    print(f"  Total VIVENDA distribuídas: {vivenda_assigned} em {len(VIVENDA_VEHICLE_IDS)} veículos")
+    
+    # Marcar veículos Vivenda como exclusivos (para não receber outras entregas)
+    vivenda_vehicle_set = set(VIVENDA_VEHICLE_IDS)
+    
     # ===== CONFIGURAR VEÍCULOS =====
-    # v7.7.0: USAR APENAS VEÍCULOS REAIS - sem veículos extras!
+    # v7.8.0: USAR APENAS VEÍCULOS REAIS - sem veículos extras!
     num_vehicles = len(request.vehicles)
     vehicles = list(request.vehicles)
     
@@ -520,7 +557,7 @@ async def optimize_routes(request: OptimizeRequest):
     )
     time_dimension = routing.GetDimensionOrDie("Time")
     
-    # v7.7.0: Janelas de tempo mais flexíveis (30min)
+    # v7.8.0: Janelas de tempo mais flexíveis (30min)
     print(f"\n=== JANELAS DE TEMPO (flexibilidade: {FLEXIBILITY_MINUTES}min) ===")
     for node in range(num_locations):
         index = manager.NodeToIndex(node)
@@ -562,13 +599,13 @@ async def optimize_routes(request: OptimizeRequest):
     for vehicle_idx in range(num_vehicles):
         routing.SetArcCostEvaluatorOfVehicle(time_callback_indices[vehicle_idx], vehicle_idx)
     
-    # v7.7.0: Custo fixo MENOR para não penalizar uso de mais veículos
+    # v7.8.0: Custo fixo MENOR para não penalizar uso de mais veículos
     # Prioridade é alocar TODAS as entregas, não minimizar veículos
     for vehicle_idx in range(num_vehicles):
         routing.SetFixedCostOfVehicle(1000, vehicle_idx)  # Custo baixo
     
     # ----- MOTORISTA PREFERENCIAL (PREFERÊNCIA SUAVE) -----
-    # v7.7.0: Motorista preferencial agora é PREFERÊNCIA, não OBRIGATÓRIO
+    # v7.8.0: Motorista preferencial agora é PREFERÊNCIA, não OBRIGATÓRIO
     # Isso evita que entregas fiquem pendentes quando o veículo preferencial não tem capacidade
     print(f"\n=== PREFERÊNCIAS DE MOTORISTA ===")
     preferred_driver_count = 0
@@ -596,20 +633,72 @@ async def optimize_routes(request: OptimizeRequest):
     if preferred_driver_count > 0:
         print(f"  Total preferências: {preferred_driver_count} (não obrigatórias)")
     
-    # ----- PRÉ-ATRIBUIÇÃO POR VEHICLE_ID -----
-    # v7.7.0: REMOVIDO - Não usar restrições rígidas para garantir 100% alocação
-    # As preferências são apenas logadas, não forçadas
+    # ----- v7.8.0: PRÉ-ATRIBUIÇÃO VIVENDA (RÍGIDA) -----
+    # Vivenda é FORÇADA nos veículos do Marcelo Mota
+    print(f"\n=== PRÉ-ATRIBUIÇÃO VIVENDA (RÍGIDA) ===")
+    vivenda_pre_assigned = 0
+    
+    # Identificar índices dos veículos Vivenda
+    vivenda_vehicle_indices = []
+    for vid in VIVENDA_VEHICLE_IDS:
+        if vid in vehicle_id_to_idx:
+            vivenda_vehicle_indices.append(vehicle_id_to_idx[vid])
+    
+    print(f"  Veículos VIVENDA (Marcelo Mota): {len(vivenda_vehicle_indices)} encontrados")
+    
+    for delivery in request.deliveries:
+        customer_name = (delivery.customer_name or "").lower()
+        
+        # Se é VIVENDA, forçar nos veículos do Marcelo Mota
+        if VIVENDA_KEYWORD in customer_name:
+            if delivery.vehicle_id and delivery.vehicle_id in vehicle_id_to_idx:
+                node = delivery_id_to_node[delivery.id]
+                vehicle_idx = vehicle_id_to_idx[delivery.vehicle_id]
+                index = manager.NodeToIndex(node)
+                routing.SetAllowedVehiclesForIndex([vehicle_idx], index)
+                vivenda_pre_assigned += 1
+                print(f"  VIVENDA FORÇADA: {delivery.customer_name} -> {vehicles[vehicle_idx].name}")
+    
+    print(f"  Total VIVENDA forçadas: {vivenda_pre_assigned}")
+    
+    # ----- v7.8.0: EXCLUSIVIDADE DOS VEÍCULOS VIVENDA -----
+    # Veículos do Marcelo Mota só aceitam VIVENDA
+    print(f"\n=== EXCLUSIVIDADE VEÍCULOS VIVENDA ===")
+    exclusivity_applied = 0
+    
+    # Identificar entregas não-Vivenda
+    non_vivenda_vehicle_indices = [i for i in range(num_vehicles) if i not in vivenda_vehicle_indices]
+    
+    for delivery in request.deliveries:
+        customer_name = (delivery.customer_name or "").lower()
+        
+        # Se NÃO é VIVENDA, proibir nos veículos do Marcelo Mota
+        if VIVENDA_KEYWORD not in customer_name:
+            node = delivery_id_to_node[delivery.id]
+            index = manager.NodeToIndex(node)
+            if non_vivenda_vehicle_indices:
+                routing.SetAllowedVehiclesForIndex(non_vivenda_vehicle_indices, index)
+                exclusivity_applied += 1
+    
+    print(f"  Entregas não-VIVENDA bloqueadas dos FIORINOs: {exclusivity_applied}")
+    print(f"  Veículos disponíveis para não-VIVENDA: {len(non_vivenda_vehicle_indices)}")
+    
+    # ----- OUTRAS PRÉ-ATRIBUIÇÕES (SUAVES) -----
     pre_assigned_count = 0
     for delivery in request.deliveries:
+        customer_name = (delivery.customer_name or "").lower()
+        # Pular Vivendas (já foram tratadas)
+        if VIVENDA_KEYWORD in customer_name:
+            continue
         if delivery.vehicle_id and delivery.vehicle_id in vehicle_id_to_idx:
             pre_assigned_count += 1
             customer = customer_map.get(delivery.customer_id)
-            customer_name = customer.name if customer else "?"
+            cname = customer.name if customer else "?"
             vehicle_idx = vehicle_id_to_idx[delivery.vehicle_id]
-            print(f"  Preferência (não rígida): {customer_name} -> {vehicles[vehicle_idx].name}")
+            print(f"  Preferência (suave): {cname} -> {vehicles[vehicle_idx].name}")
     
     if pre_assigned_count > 0:
-        print(f"  Total preferências: {pre_assigned_count} (OR-Tools livre para realocar)")
+        print(f"  Total preferências suaves: {pre_assigned_count}")
     
     # ----- GRUPOS DE ENTREGAS -----
     if request.delivery_groups:
@@ -636,14 +725,14 @@ async def optimize_routes(request: OptimizeRequest):
                 print(f"  Grupo {group_idx + 1}: {len(group_nodes)} entregas vinculadas")
     
     # ----- RESTRIÇÕES DE EXCLUSIVIDADE -----
-    # v7.7.0: REMOVIDO - Não usar restrições rígidas
+    # v7.8.0: REMOVIDO - Não usar restrições rígidas
     # Exclusividade de veículos foi desativada para garantir 100% de alocação
     if hasattr(request, 'vehicle_exclusive_rules') and request.vehicle_exclusive_rules:
-        print(f"\n=== EXCLUSIVIDADE (DESATIVADA v7.7.0) ===")
+        print(f"\n=== EXCLUSIVIDADE (DESATIVADA v7.8.0) ===")
         print(f"  {len(request.vehicle_exclusive_rules)} regras de exclusividade ignoradas")
         print(f"  Motivo: Prioridade é alocar 100% das entregas")
     
-    # ----- PENALIDADES v7.7.0 -----
+    # ----- PENALIDADES v7.8.0 -----
     # Penalidade EXTREMA para garantir 100% de alocação
     print(f"\n=== PENALIDADES ===")
     print(f"Penalidade por não-atendimento: {PENALTY_UNASSIGNED:,}")
@@ -651,7 +740,7 @@ async def optimize_routes(request: OptimizeRequest):
     for node in range(1, num_locations):
         routing.AddDisjunction([manager.NodeToIndex(node)], PENALTY_UNASSIGNED)
     
-    # ----- PARÂMETROS DE BUSCA v7.7.0 -----
+    # ----- PARÂMETROS DE BUSCA v7.8.0 -----
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -848,12 +937,12 @@ async def optimize_routes(request: OptimizeRequest):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.7.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.8.0"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "7.7.0"}
+    return {"status": "healthy", "version": "7.8.0"}
 
 
 
