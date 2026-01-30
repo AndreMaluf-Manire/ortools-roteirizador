@@ -2,17 +2,18 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
+VERSÃO 7.5.0 - MOTORISTA PREFERENCIAL:
+- preferred_driver_id: Motorista preferencial do cliente (cadastro)
+- Pré-atribuição automática ao primeiro veículo do motorista
+- Prioridade: preferred_driver_id < vehicle_id < regras
+- Logs detalhados de pré-atribuições
+
 VERSÃO 7.4.0 - NOVAS REGRAS DE ROTEAMENTO:
 - vehicle_exclusive_for_group: Veículo(s) exclusivo(s) para grupo específico
 - force_multiple_vehicles: Forçar distribuição em múltiplos veículos
 - fixed_driver com múltiplos veículos (vehicle_ids em action)
 - Distribuição balanceada (round-robin) ou sequencial
 - Restrições de exclusividade via SetAllowedVehiclesForIndex
-- Logs detalhados de processamento de regras
-- Soft Time Windows (flexibilidade de 15min)
-- Penalidade aumentada para não-atendimento (100M)
-- Tempo de solução aumentado (120s)
-- Garante 100% de alocação das entregas
 """
 
 from fastapi import FastAPI, HTTPException, Header
@@ -28,7 +29,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.4.0"
+    version="7.5.0"
 )
 
 app.add_middleware(
@@ -77,6 +78,7 @@ class Delivery(BaseModel):
     weight_kg: float = 0
     value: float = 0
     vehicle_id: Optional[str] = None  # NOVO: pré-atribuição a veículo
+    preferred_driver_id: Optional[str] = None  # NOVO: motorista preferencial do cliente
 
 
 class Vehicle(BaseModel):
@@ -718,6 +720,36 @@ def solve_vrptw(request: OptimizeRequest) -> OptimizeResponse:
         for vehicle_idx in range(num_vehicles):
             routing.SetFixedCostOfVehicle(100000, vehicle_idx)
     
+    # ----- PRÉ-ATRIBUIÇÃO POR MOTORISTA PREFERENCIAL (preferred_driver_id) -----
+    preferred_driver_count = 0
+    for delivery in request.deliveries:
+        # Pular se já tem vehicle_id (prioridade maior)
+        if delivery.vehicle_id:
+            continue
+            
+        if delivery.preferred_driver_id:
+            # Buscar primeiro veículo ativo do motorista preferencial
+            preferred_vehicle_idx = None
+            for idx, vehicle in enumerate(vehicles):
+                if vehicle.freteiro_id == delivery.preferred_driver_id:
+                    preferred_vehicle_idx = idx
+                    break
+            
+            if preferred_vehicle_idx is not None:
+                node = delivery_id_to_node[delivery.id]
+                index = manager.NodeToIndex(node)
+                
+                # Forçar que este nó seja atendido por este veículo
+                routing.SetAllowedVehiclesForIndex([preferred_vehicle_idx], index)
+                preferred_driver_count += 1
+                
+                customer = customer_map.get(delivery.customer_id)
+                customer_name = customer.name if customer else "?"
+                print(f"  Motorista Preferencial: {customer_name} -> {vehicles[preferred_vehicle_idx].name}")
+    
+    if preferred_driver_count > 0:
+        print(f"\n  Total pré-atribuições por motorista preferencial: {preferred_driver_count}")
+    
     # ----- PRÉ-ATRIBUIÇÃO DE ENTREGAS (vehicle_id em delivery) -----
     pre_assigned_count = 0
     for delivery in request.deliveries:
@@ -1142,7 +1174,7 @@ def recalculate_route_times(request: RecalculateRequest) -> RecalculateResponse:
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.4.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.5.0"}
 
 
 @app.get("/health")
