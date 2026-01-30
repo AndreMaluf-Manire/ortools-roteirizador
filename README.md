@@ -51,3 +51,4 @@ python main.py
 ```
 
 Acesse: http://localhost:8000/docs (Swagger UI)
+# v7.6.0
