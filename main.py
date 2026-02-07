@@ -2,20 +2,20 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 10.0 - CORREÇÕES CRÍTICAS FIXED DRIVER E VIVENDA:
-- Fixed Driver agora é FORÇADO no solver (não apenas preferência)
-- Janela INFINITA para entregas Vivenda (ignora horário de fechamento)
-- Exclusividade bidirecional Vivenda mantida
+VERSÃO 10.1 - HIERARQUIA DE CUSTOS + SUPER FIXED DRIVER:
+- Hierarquia de custos por tipo de veículo (própria: 500, agregado pequeno: 5k, agregado grande: 10k)
+- Fixed Driver com janela infinita (evita órfãs)
+- Vivenda com janela infinita mantida
+- Exclusividade bidirecional Vivenda
 - Balanceamento inteligente por Bin Packing
-- Prioridade ABSOLUTA: 100% de alocação (penalidade 10 trilhões)
-- Custo fixo de veículos = 0
-- Soft time windows para não-Vivenda
+- Prioridade ABSOLUTA: 100% de alocação (penalidade 100 trilhões)
+- Soft time windows para entregas normais
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import os
@@ -25,7 +25,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="10.0"
+    version="10.1"
 )
 
 app.add_middleware(
@@ -40,8 +40,13 @@ app.add_middleware(
 DEFAULT_SPEED_KMH = 16.0
 MAX_TIME_HORIZON = 1440
 DEFAULT_SERVICE_TIME = 15
-PENALTY_UNASSIGNED = 10_000_000_000_000
+PENALTY_UNASSIGNED = 100_000_000_000_000
 SOLUTION_TIME_LIMIT = 60
+
+# Custos fixos por tipo de veículo
+COST_FROTA_PROPRIA = 500
+COST_AGREGADO_PEQUENO = 5000
+COST_AGREGADO_GRANDE = 10000
 
 
 # ============== MODELOS DE DADOS ==============
@@ -238,6 +243,37 @@ def create_distance_matrix(locations: List[Location]) -> List[List[float]]:
     return matrix
 
 
+def classify_vehicle_cost(vehicle: Vehicle) -> int:
+    """
+    Classifica veículo por tipo e retorna custo fixo apropriado.
+    
+    Hierarquia:
+    - Frota Própria: 500
+    - Agregado Pequeno (Fiorino, Doblo): 5.000
+    - Agregado Grande (HR, Iveco, Caminhão, VUC): 10.000
+    """
+    vehicle_name = vehicle.name.upper()
+    vehicle_id = vehicle.id.upper()
+    
+    # Identificar agregados
+    agregado_keywords = ['OUTROS', 'FRETEIRO', 'AGREGADO', 'TERCEIRO']
+    is_agregado = any(kw in vehicle_name or kw in vehicle_id for kw in agregado_keywords)
+    
+    if not is_agregado:
+        # Frota própria
+        return COST_FROTA_PROPRIA
+    
+    # Agregados: classificar por tamanho
+    agregado_grande_keywords = ['HR', 'IVECO', 'CAMINHÃO', 'CAMINHAO', 'VUC', 'TRUCK', '3/4', 'TOCO']
+    is_grande = any(kw in vehicle_name for kw in agregado_grande_keywords)
+    
+    if is_grande:
+        return COST_AGREGADO_GRANDE
+    else:
+        # Agregado pequeno (Fiorino, Doblo, etc)
+        return COST_AGREGADO_PEQUENO
+
+
 def apply_vivenda_rule(
     deliveries: List[Delivery],
     vehicles: List[Vehicle],
@@ -327,7 +363,7 @@ async def optimize_routes(request: OptimizeRequest):
     start_time_ms = time.time() * 1000
     
     print(f"\n{'='*60}")
-    print(f"=== OTIMIZAÇÃO v10.0 - FIXED DRIVER + VIVENDA INFINITA ===")
+    print(f"=== OTIMIZAÇÃO v10.1 - HIERARQUIA DE CUSTOS ===")
     print(f"{'='*60}")
     print(f"Depot: {request.depot.name}")
     print(f"Entregas: {len(request.deliveries)}")
@@ -383,42 +419,17 @@ async def optimize_routes(request: OptimizeRequest):
     
     num_locations = len(locations)
     
-    # CORREÇÃO 2: Janela INFINITA para Vivenda
-    print(f"\n=== CONSTRUINDO JANELAS DE TEMPO ===")
-    time_windows = [(0, MAX_TIME_HORIZON)]
-    vivenda_count = 0
+    # NOVIDADE v10.1: Conjunto de IDs com janela infinita
+    infinite_window_ids: Set[str] = set()
     
-    for delivery in request.deliveries:
-        customer = customer_map.get(delivery.customer_id)
-        customer_name = (delivery.customer_name or "").lower()
-        
-        # Verificar se é Vivenda
-        is_vivenda = vivenda_keyword and vivenda_keyword in customer_name
-        
-        if is_vivenda:
-            # JANELA INFINITA para Vivenda (ignora horário de fechamento)
-            time_windows.append((0, MAX_TIME_HORIZON))
-            vivenda_count += 1
-            print(f"  Vivenda detectada: {delivery.customer_name} -> Janela INFINITA (0, {MAX_TIME_HORIZON})")
-        else:
-            # Janela normal do cliente
-            if customer and customer.window_start is not None and customer.window_end is not None:
-                time_windows.append((customer.window_start, customer.window_end))
-            else:
-                time_windows.append((0, MAX_TIME_HORIZON))
+    # Adicionar Vivendas ao conjunto de janela infinita
+    if vivenda_keyword:
+        for delivery in request.deliveries:
+            customer_name = (delivery.customer_name or "").lower()
+            if vivenda_keyword in customer_name:
+                infinite_window_ids.add(delivery.id)
     
-    if vivenda_count > 0:
-        print(f"  Total entregas Vivenda com janela infinita: {vivenda_count}")
-    
-    service_times = [0]
-    for delivery in request.deliveries:
-        customer = customer_map.get(delivery.customer_id)
-        if customer:
-            service_times.append(customer.service_time)
-        else:
-            service_times.append(DEFAULT_SERVICE_TIME)
-    
-    # CORREÇÃO 1: Criar dicionário para Fixed Driver
+    # Processar regras e identificar Fixed Drivers
     fixed_assignments = {}
     
     rules_applied_count = 0
@@ -464,9 +475,10 @@ async def optimize_routes(request: OptimizeRequest):
                                     break
                         
                         if target_vehicle:
-                            # Armazenar para aplicar depois
                             fixed_assignments[delivery.id] = target_vehicle.id
-                            print(f"  ✅ {customer_name} → veículo {target_vehicle.id} (SERÁ FORÇADO)")
+                            # NOVIDADE v10.1: Adicionar ao conjunto de janela infinita
+                            infinite_window_ids.add(delivery.id)
+                            print(f"  ✅ {customer_name} → veículo {target_vehicle.id} (FORÇADO + JANELA INFINITA)")
                             rules_applied_count += 1
             
             elif rule.type == "max_stops":
@@ -556,10 +568,42 @@ async def optimize_routes(request: OptimizeRequest):
         
         print(f"\nRegras aplicadas: {rules_applied_count}")
     
+    # Construir janelas de tempo
+    print(f"\n=== CONSTRUINDO JANELAS DE TEMPO ===")
+    time_windows = [(0, MAX_TIME_HORIZON)]
+    infinite_count = 0
+    
+    for delivery in request.deliveries:
+        customer = customer_map.get(delivery.customer_id)
+        
+        # NOVIDADE v10.1: Verificar se está no conjunto de janela infinita
+        if delivery.id in infinite_window_ids:
+            time_windows.append((0, MAX_TIME_HORIZON))
+            infinite_count += 1
+            reason = "Vivenda" if vivenda_keyword and vivenda_keyword in (delivery.customer_name or "").lower() else "Fixed Driver"
+            print(f"  {reason}: {delivery.customer_name} -> Janela INFINITA (0, {MAX_TIME_HORIZON})")
+        else:
+            # Janela normal do cliente
+            if customer and customer.window_start is not None and customer.window_end is not None:
+                time_windows.append((customer.window_start, customer.window_end))
+            else:
+                time_windows.append((0, MAX_TIME_HORIZON))
+    
+    if infinite_count > 0:
+        print(f"  Total entregas com janela infinita: {infinite_count}")
+    
+    service_times = [0]
+    for delivery in request.deliveries:
+        customer = customer_map.get(delivery.customer_id)
+        if customer:
+            service_times.append(customer.service_time)
+        else:
+            service_times.append(DEFAULT_SERVICE_TIME)
+    
     num_vehicles = len(request.vehicles)
     vehicles = list(request.vehicles)
     
-    print(f"\n=== VEÍCULOS ===")
+    print(f"\n=== VEÍCULOS E CUSTOS ===")
     print(f"Total de veículos REAIS: {num_vehicles}")
     
     if num_vehicles == 0:
@@ -574,9 +618,15 @@ async def optimize_routes(request: OptimizeRequest):
             optimization_time_ms=int(time.time() * 1000 - start_time_ms)
         )
     
+    # NOVIDADE v10.1: Classificar e exibir custos
+    vehicle_costs = []
     for idx, v in enumerate(vehicles):
         speed = v.average_speed_kmh if v.average_speed_kmh else default_speed
-        print(f"  {idx+1}. {v.name}: {v.capacity_boxes} caixas, {speed} km/h")
+        cost = classify_vehicle_cost(v)
+        vehicle_costs.append(cost)
+        
+        cost_label = "Própria" if cost == COST_FROTA_PROPRIA else ("Agregado Pequeno" if cost == COST_AGREGADO_PEQUENO else "Agregado Grande")
+        print(f"  {idx+1}. {v.name}: {v.capacity_boxes} cx, {speed} km/h, Custo: {cost:,} ({cost_label})")
     
     time_matrices = create_time_matrix_per_vehicle(locations, vehicles, default_speed)
     distance_matrix = create_distance_matrix(locations)
@@ -634,12 +684,12 @@ async def optimize_routes(request: OptimizeRequest):
         index = manager.NodeToIndex(node)
         window_start, window_end = time_windows[node]
         
-        # Aplicar flexibilidade apenas para não-Vivenda
+        # Aplicar flexibilidade apenas para entregas normais (não infinitas)
         if window_end < MAX_TIME_HORIZON:
             flexible_start = max(0, window_start - 60)
             flexible_end = min(MAX_TIME_HORIZON, window_end + 60)
         else:
-            # Vivenda já tem janela infinita, manter como está
+            # Janela infinita, manter como está
             flexible_start = window_start
             flexible_end = window_end
         
@@ -672,11 +722,15 @@ async def optimize_routes(request: OptimizeRequest):
     for vehicle_idx in range(num_vehicles):
         routing.SetArcCostEvaluatorOfVehicle(time_callback_indices[vehicle_idx], vehicle_idx)
     
-    print(f"\n=== CUSTOS DE VEÍCULOS ===")
-    print(f"Custo fixo por veículo: 0 (priorizar alocação vs economia)")
+    # NOVIDADE v10.1: Aplicar custos hierárquicos
+    print(f"\n=== APLICANDO CUSTOS HIERÁRQUICOS ===")
+    print(f"Frota Própria: {COST_FROTA_PROPRIA:,}")
+    print(f"Agregado Pequeno: {COST_AGREGADO_PEQUENO:,}")
+    print(f"Agregado Grande: {COST_AGREGADO_GRANDE:,}")
     
     for vehicle_idx in range(num_vehicles):
-        routing.SetFixedCostOfVehicle(0, vehicle_idx)
+        cost = vehicle_costs[vehicle_idx]
+        routing.SetFixedCostOfVehicle(cost, vehicle_idx)
     
     print(f"\n=== PREFERÊNCIAS DE MOTORISTA ===")
     preferred_driver_count = 0
@@ -701,7 +755,7 @@ async def optimize_routes(request: OptimizeRequest):
     if preferred_driver_count > 0:
         print(f"  Total preferências: {preferred_driver_count} (não obrigatórias)")
     
-    # CORREÇÃO 1 (aplicação): Aplicar Fixed Driver assignments
+    # Aplicar Fixed Driver assignments
     if fixed_assignments:
         print(f"\n=== APLICANDO FIXED DRIVER (RÍGIDO) ===")
         for delivery_id, vehicle_id in fixed_assignments.items():
@@ -873,7 +927,10 @@ async def optimize_routes(request: OptimizeRequest):
         current_time = request.start_time
         prev_node = 0
         
-        print(f"\n=== ROTA {vehicle_idx + 1}: {vehicle.name} ({vehicle_speed} km/h) ===")
+        vehicle_cost = vehicle_costs[vehicle_idx]
+        cost_type = "Própria" if vehicle_cost == COST_FROTA_PROPRIA else ("Agreg.Peq" if vehicle_cost == COST_AGREGADO_PEQUENO else "Agreg.Grande")
+        
+        print(f"\n=== ROTA {vehicle_idx + 1}: {vehicle.name} ({cost_type}, custo {vehicle_cost:,}) ===")
         print(f"Saída do depot: {minutes_to_time(request.start_time)}")
         
         for seq, node in enumerate(route_nodes):
@@ -1004,12 +1061,12 @@ async def optimize_routes(request: OptimizeRequest):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "10.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "10.1"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "10.0"}
+    return {"status": "healthy", "version": "10.1"}
 
 
 if __name__ == "__main__":
