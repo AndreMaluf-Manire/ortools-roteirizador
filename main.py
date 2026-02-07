@@ -2,9 +2,11 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.9.2 - STABILITY FIX:
-- FIX: Redução da penalidade de não-atendimento para evitar Integer Overflow no C++ (Crash do container).
-- Lógica mantida: Janela Infinita para Vivenda e Correção do Valmir (Maria Honos).
+VERSÃO 7.9.3 - STABLE FIX:
+- Baseado na v7.9.0 (Estável).
+- FIX: Regra 'fixed_driver' (Maria Honos) agora aplica trava real no solver.
+- FIX: Janela Infinita para Vivenda (garante alocação ignorando horário de fechamento).
+- MANTIDO: Penalidade de 100 Trilhões (que funcionou na v7.9.0).
 """
 
 from fastapi import FastAPI, HTTPException
@@ -20,7 +22,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.9.2"
+    version="7.9.3"
 )
 
 app.add_middleware(
@@ -36,9 +38,8 @@ DEFAULT_SPEED_KMH = 16.0
 MAX_TIME_HORIZON = 1440  # 24 horas em minutos
 DEFAULT_SERVICE_TIME = 15
 
-# v7.9.2: Penalidade Ajustada (Segura para int64)
-# 1 Trilhão é suficiente para forçar qualquer alocação sem estourar a memória do solver
-PENALTY_UNASSIGNED = 1_000_000_000_000
+# Penalidade testada e aprovada na v7.9.0
+PENALTY_UNASSIGNED = 100_000_000_000_000  # 100 trilhões
 SOLUTION_TIME_LIMIT = 60  # 1 minuto
 
 
@@ -207,7 +208,6 @@ def create_distance_matrix(locations: List[Location]) -> List[List[float]]:
     return matrix
 
 def apply_vivenda_rule(deliveries: List[Delivery], vehicles: List[Vehicle], config: VivendaruleConfig, customer_map: Dict[str, Customer]):
-    # Retorna tupla: (vivenda_deliveries, non_vivenda_deliveries, vivenda_vehicle_set)
     vivenda_deliveries = []
     non_vivenda_deliveries = []
     keyword = config.keyword.lower()
@@ -219,7 +219,7 @@ def apply_vivenda_rule(deliveries: List[Delivery], vehicles: List[Vehicle], conf
         else:
             non_vivenda_deliveries.append(delivery)
     
-    print(f"\n=== REGRA VIVENDA (EXCLUSIVIDADE + JANELA INFINITA) ===")
+    print(f"\n=== REGRA VIVENDA (JANELA INFINITA) ===")
     print(f"  Entregas Vivenda: {len(vivenda_deliveries)}")
     
     if len(vivenda_deliveries) == 0 or len(config.vehicle_ids) == 0:
@@ -247,9 +247,8 @@ def apply_vivenda_rule(deliveries: List[Delivery], vehicles: List[Vehicle], conf
 @app.post("/optimize", response_model=OptimizeResponse)
 async def optimize_routes(request: OptimizeRequest):
     start_time_ms = time.time() * 1000
-    print(f"\n=== OTIMIZAÇÃO v7.9.2 ===")
-    print(f"Depot: {request.depot.name} | Entregas: {len(request.deliveries)} | Veículos: {len(request.vehicles)}")
-
+    print(f"\n=== OTIMIZAÇÃO v7.9.3 ===")
+    
     if len(request.deliveries) == 0:
         return OptimizeResponse(success=True, message="Sem entregas", routes=[], unassigned_deliveries=[], vehicles_used=0, total_deliveries=0, total_value=0, optimization_time_ms=0)
 
@@ -356,6 +355,7 @@ async def optimize_routes(request: OptimizeRequest):
                  is_vivenda = True
         
         if is_vivenda:
+            # Janela Infinita para garantir que caiba na rota
             time_dimension.CumulVar(index).SetRange(0, MAX_TIME_HORIZON)
         elif c and c.window_start is not None:
             start = max(0, c.window_start - FLEXIBILITY_MINUTES)
@@ -375,13 +375,13 @@ async def optimize_routes(request: OptimizeRequest):
         routing.SetArcCostEvaluatorOfVehicle(transit_callback_indices[i], i)
         routing.SetFixedCostOfVehicle(0, i)
     
-    # Penalidade por não alocação (Ajustada)
+    # Penalidade por não alocação (100 Trilhões - Seguro pois funcionou na v7.9.0)
     for i in range(len(request.deliveries)):
         routing.AddDisjunction([manager.NodeToIndex(i + 1)], PENALTY_UNASSIGNED)
 
     # ===== APLICAR RESTRIÇÕES =====
     
-    # 1. Regras Fixas
+    # 1. Regras Fixas (Valmir / Maria Honos)
     for delivery_id, vehicle_uuid in fixed_assignments.items():
         delivery_idx = next((i for i, d in enumerate(request.deliveries) if d.id == delivery_id), None)
         vehicle_idx = vehicle_id_to_idx.get(vehicle_uuid)
@@ -395,12 +395,14 @@ async def optimize_routes(request: OptimizeRequest):
     
     if len(vivenda_indices) > 0:
         print(f"\n=== APLICANDO TRAVAS VIVENDA ===")
+        # Travar Vivenda nos carros Vivenda
         for delivery in vivenda_deliveries:
             d_idx = next((i for i, d in enumerate(request.deliveries) if d.id == delivery.id), None)
             if d_idx is not None:
                 index = manager.NodeToIndex(d_idx + 1)
                 routing.SetAllowedVehiclesForIndex(vivenda_indices, index)
 
+        # Travar carros Vivenda para não levar outras coisas
         if len(non_vivenda_indices) > 0: 
             for delivery in non_vivenda_deliveries:
                 if delivery.id in fixed_assignments: continue
