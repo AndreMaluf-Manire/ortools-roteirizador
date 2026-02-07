@@ -2,11 +2,9 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.9.1 - CORREÇÃO DE REGRAS E JANELAS INFINITAS VIVENDA:
-- FIX: Regra 'fixed_driver' (Maria Honos) agora aplica restrição real no solver.
-- FEATURE: "Janela Infinita" para Vivenda. O sistema ignora restrições de horário 
-  para clientes Vivenda para garantir que os 2 carros consigam fazer tudo.
-- TUNING: Aumento da penalidade de não-atendimento para garantir alocação total.
+VERSÃO 7.9.2 - STABILITY FIX:
+- FIX: Redução da penalidade de não-atendimento para evitar Integer Overflow no C++ (Crash do container).
+- Lógica mantida: Janela Infinita para Vivenda e Correção do Valmir (Maria Honos).
 """
 
 from fastapi import FastAPI, HTTPException
@@ -22,7 +20,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.9.1"
+    version="7.9.2"
 )
 
 app.add_middleware(
@@ -38,8 +36,9 @@ DEFAULT_SPEED_KMH = 16.0
 MAX_TIME_HORIZON = 1440  # 24 horas em minutos
 DEFAULT_SERVICE_TIME = 15
 
-# v7.9.1: Penalidade AINDA MAIOR
-PENALTY_UNASSIGNED = 100_000_000_000_000_000  # 100 quatrilhões
+# v7.9.2: Penalidade Ajustada (Segura para int64)
+# 1 Trilhão é suficiente para forçar qualquer alocação sem estourar a memória do solver
+PENALTY_UNASSIGNED = 1_000_000_000_000
 SOLUTION_TIME_LIMIT = 60  # 1 minuto
 
 
@@ -207,7 +206,8 @@ def create_distance_matrix(locations: List[Location]) -> List[List[float]]:
                 matrix[i][j] = haversine_distance(locations[i].lat, locations[i].lng, locations[j].lat, locations[j].lng)
     return matrix
 
-def apply_vivenda_rule(deliveries: List[Delivery], vehicles: List[Vehicle], config: VivendaruleConfig, customer_map: Dict[str, Customer]) -> tuple[List[Delivery], List[Delivery], set]:
+def apply_vivenda_rule(deliveries: List[Delivery], vehicles: List[Vehicle], config: VivendaruleConfig, customer_map: Dict[str, Customer]):
+    # Retorna tupla: (vivenda_deliveries, non_vivenda_deliveries, vivenda_vehicle_set)
     vivenda_deliveries = []
     non_vivenda_deliveries = []
     keyword = config.keyword.lower()
@@ -247,7 +247,7 @@ def apply_vivenda_rule(deliveries: List[Delivery], vehicles: List[Vehicle], conf
 @app.post("/optimize", response_model=OptimizeResponse)
 async def optimize_routes(request: OptimizeRequest):
     start_time_ms = time.time() * 1000
-    print(f"\n=== OTIMIZAÇÃO v7.9.1 ===")
+    print(f"\n=== OTIMIZAÇÃO v7.9.2 ===")
     print(f"Depot: {request.depot.name} | Entregas: {len(request.deliveries)} | Veículos: {len(request.vehicles)}")
 
     if len(request.deliveries) == 0:
@@ -275,7 +275,6 @@ async def optimize_routes(request: OptimizeRequest):
         non_vivenda_deliveries = request.deliveries
 
     # ===== 2. PREPARAR REGRAS FIXAS (MARIA HONOS) =====
-    # Dicionário para armazenar restrições rígidas: delivery_id -> vehicle_id (UUID)
     fixed_assignments = {} 
     
     if request.routing_rules:
@@ -287,7 +286,6 @@ async def optimize_routes(request: OptimizeRequest):
                 freteiro_id = rule.action.freteiro_id
                 target_vehicle_ids = rule.action.vehicle_ids
                 
-                # Encontrar veículos alvo
                 possible_vehicles = []
                 for v in request.vehicles:
                     if v.freteiro_id == freteiro_id:
@@ -297,12 +295,9 @@ async def optimize_routes(request: OptimizeRequest):
                 if not possible_vehicles:
                     continue
                     
-                target_vehicle = possible_vehicles[0] # Pega o primeiro disponível
+                target_vehicle = possible_vehicles[0]
                 
-                # Aplicar a entregas compatíveis
-                count_fixed = 0
                 for delivery in request.deliveries:
-                    # Se já tem fixo (ex: Vivenda), não mexe
                     if delivery.vehicle_id: continue 
                     if delivery.id in fixed_assignments: continue
 
@@ -316,25 +311,20 @@ async def optimize_routes(request: OptimizeRequest):
                         
                     if matches:
                         fixed_assignments[delivery.id] = target_vehicle.id
-                        count_fixed += 1
                         print(f"  🔒 FIXADO: {delivery.customer_name} -> {target_vehicle.name}")
 
     # ===== OR-TOOLS SETUP =====
-    # Locations
     locations = [request.depot.location]
     for d in request.deliveries:
         c = customer_map.get(d.customer_id)
         locations.append(c.location if c else request.depot.location)
     
-    # Matrices
     time_matrices = create_time_matrix_per_vehicle(locations, request.vehicles, DEFAULT_SPEED_KMH)
     distance_matrix = create_distance_matrix(locations)
     
-    # Manager & Routing
     manager = pywrapcp.RoutingIndexManager(len(locations), num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
     
-    # Callbacks (Time & Capacity)
     def make_time_callback(v_idx):
         t_mat = time_matrices.get(v_idx, time_matrices[0])
         def cb(from_idx, to_idx):
@@ -348,20 +338,17 @@ async def optimize_routes(request: OptimizeRequest):
 
     transit_callback_indices = [routing.RegisterTransitCallback(make_time_callback(i)) for i in range(num_vehicles)]
     
-    # Dimension: Time
     routing.AddDimension(
-        transit_callback_indices[0], # Usa matriz 0 como base para limite
+        transit_callback_indices[0],
         MAX_TIME_HORIZON, MAX_TIME_HORIZON, False, "Time"
     )
     time_dimension = routing.GetDimensionOrDie("Time")
     
-    # Janelas de Tempo
+    # Janelas de Tempo (Soft + Infinita para Vivenda)
     for i, delivery in enumerate(request.deliveries):
         index = manager.NodeToIndex(i + 1)
         c = customer_map.get(delivery.customer_id)
         
-        # === MÁGICA: Janela Infinita para Vivenda ===
-        # Se for Vivenda, IGNORA a janela do cadastro e permite o dia todo (0 a 1440 min)
         is_vivenda = False
         if optimization_config.vivenda_rule and optimization_config.vivenda_rule.enabled:
              keyword = optimization_config.vivenda_rule.keyword.lower()
@@ -369,19 +356,13 @@ async def optimize_routes(request: OptimizeRequest):
                  is_vivenda = True
         
         if is_vivenda:
-            # Vivenda pode ser entregue a qualquer hora do dia para garantir que caiba na rota
             time_dimension.CumulVar(index).SetRange(0, MAX_TIME_HORIZON)
-        
         elif c and c.window_start is not None:
-            # Clientes normais: Tenta respeitar janela + tolerância
             start = max(0, c.window_start - FLEXIBILITY_MINUTES)
-            end = min(MAX_TIME_HORIZON, c.window_end + FLEXIBILITY_MINUTES + 120) # +2h de margem de pânico
+            end = min(MAX_TIME_HORIZON, c.window_end + FLEXIBILITY_MINUTES + 120)
             time_dimension.CumulVar(index).SetRange(start, end)
-            
-            # Penalidade suave se atrasar além da tolerância básica
             time_dimension.SetCumulVarSoftUpperBound(index, c.window_end + FLEXIBILITY_MINUTES, 10000)
 
-    # Dimension: Capacity
     def capacity_callback(from_index):
         node = manager.IndexToNode(from_index)
         if node == 0: return 0
@@ -390,43 +371,36 @@ async def optimize_routes(request: OptimizeRequest):
     cap_idx = routing.RegisterUnaryTransitCallback(capacity_callback)
     routing.AddDimensionWithVehicleCapacity(cap_idx, 0, [v.capacity_boxes for v in request.vehicles], True, "Capacity")
 
-    # Custos e Penalidades
     for i in range(num_vehicles):
         routing.SetArcCostEvaluatorOfVehicle(transit_callback_indices[i], i)
-        routing.SetFixedCostOfVehicle(0, i) # Priorizar uso de frota
+        routing.SetFixedCostOfVehicle(0, i)
     
-    # Penalidade por não alocação (MONSTRUOSA)
+    # Penalidade por não alocação (Ajustada)
     for i in range(len(request.deliveries)):
         routing.AddDisjunction([manager.NodeToIndex(i + 1)], PENALTY_UNASSIGNED)
 
-    # ===== APLICAR RESTRIÇÕES (FIX & VIVENDA) =====
+    # ===== APLICAR RESTRIÇÕES =====
     
-    # 1. Regras Fixas (Maria Honos)
+    # 1. Regras Fixas
     for delivery_id, vehicle_uuid in fixed_assignments.items():
-        # Encontrar index da entrega
         delivery_idx = next((i for i, d in enumerate(request.deliveries) if d.id == delivery_id), None)
         vehicle_idx = vehicle_id_to_idx.get(vehicle_uuid)
-        
         if delivery_idx is not None and vehicle_idx is not None:
             index = manager.NodeToIndex(delivery_idx + 1)
             routing.SetAllowedVehiclesForIndex([vehicle_idx], index)
 
-    # 2. Regras Vivenda (Forçar nos carros do Marcelo)
-    # Como abrimos a janela de tempo, agora deve caber tudo!
+    # 2. Regras Vivenda
     vivenda_indices = [vehicle_id_to_idx[vid] for vid in vivenda_vehicle_set if vid in vehicle_id_to_idx]
     non_vivenda_indices = [i for i in range(num_vehicles) if i not in vivenda_indices]
     
     if len(vivenda_indices) > 0:
         print(f"\n=== APLICANDO TRAVAS VIVENDA ===")
-        
-        # Travar entregas Vivenda nos carros Vivenda
         for delivery in vivenda_deliveries:
             d_idx = next((i for i, d in enumerate(request.deliveries) if d.id == delivery.id), None)
             if d_idx is not None:
                 index = manager.NodeToIndex(d_idx + 1)
                 routing.SetAllowedVehiclesForIndex(vivenda_indices, index)
 
-        # Travar carros Vivenda para NÃO levar outras coisas
         if len(non_vivenda_indices) > 0: 
             for delivery in non_vivenda_deliveries:
                 if delivery.id in fixed_assignments: continue
@@ -435,7 +409,6 @@ async def optimize_routes(request: OptimizeRequest):
                     index = manager.NodeToIndex(d_idx + 1)
                     routing.SetAllowedVehiclesForIndex(non_vivenda_indices, index)
 
-    # Solve
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -446,7 +419,6 @@ async def optimize_routes(request: OptimizeRequest):
     if not solution:
         return OptimizeResponse(success=False, message="Falha na solução", routes=[], unassigned_deliveries=[], vehicles_used=0, total_deliveries=0, total_value=0, optimization_time_ms=0)
 
-    # Extrair rotas (código padrão simplificado)
     routes = []
     vehicles_used = 0
     assigned_ids = set()
@@ -455,7 +427,6 @@ async def optimize_routes(request: OptimizeRequest):
     for v_idx in range(num_vehicles):
         index = routing.Start(v_idx)
         stops = []
-        route_dist = 0
         route_boxes = 0
         
         while not routing.IsEnd(index):
