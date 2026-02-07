@@ -2,16 +2,14 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
-VERSÃO 7.9.0 - EXCLUSIVIDADE BIDIRECIONAL + PRIORITY 0:
-- Regra Vivenda DINÂMICA (ativada via payload JSON)
-- Exclusividade bidirecional: Vivenda SÓ nos FIORINOs, FIORINOs SÓ para Vivenda
-- Balanceamento inteligente por Bin Packing (volume/peso)
+VERSÃO 10.0 - CORREÇÕES CRÍTICAS FIXED DRIVER E VIVENDA:
+- Fixed Driver agora é FORÇADO no solver (não apenas preferência)
+- Janela INFINITA para entregas Vivenda (ignora horário de fechamento)
+- Exclusividade bidirecional Vivenda mantida
+- Balanceamento inteligente por Bin Packing
 - Prioridade ABSOLUTA: 100% de alocação (penalidade 10 trilhões)
-- Custo fixo de veículos = 0 (priorizar alocação vs economia)
-- Flexibilidade de janelas dinâmica (default 15min, máx 60min)
-- Soft time windows para evitar deadlocks
-- Fixed Driver com restrição real no solver
-- Janela infinita para entregas Vivenda
+- Custo fixo de veículos = 0
+- Soft time windows para não-Vivenda
 """
 
 from fastapi import FastAPI, HTTPException
@@ -27,7 +25,7 @@ import time
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="7.9.0"
+    version="10.0"
 )
 
 app.add_middleware(
@@ -329,7 +327,7 @@ async def optimize_routes(request: OptimizeRequest):
     start_time_ms = time.time() * 1000
     
     print(f"\n{'='*60}")
-    print(f"=== OTIMIZAÇÃO v7.9.0 - PRIORITY 0 + VIVENDA DINÂMICA ===")
+    print(f"=== OTIMIZAÇÃO v10.0 - FIXED DRIVER + VIVENDA INFINITA ===")
     print(f"{'='*60}")
     print(f"Depot: {request.depot.name}")
     print(f"Entregas: {len(request.deliveries)}")
@@ -360,8 +358,10 @@ async def optimize_routes(request: OptimizeRequest):
     vivenda_deliveries = []
     non_vivenda_deliveries = []
     vivenda_vehicle_set = set()
+    vivenda_keyword = ""
     
     if optimization_config.vivenda_rule and optimization_config.vivenda_rule.enabled:
+        vivenda_keyword = optimization_config.vivenda_rule.keyword.lower()
         vivenda_deliveries, non_vivenda_deliveries, vivenda_vehicle_set = apply_vivenda_rule(
             request.deliveries,
             request.vehicles,
@@ -383,13 +383,32 @@ async def optimize_routes(request: OptimizeRequest):
     
     num_locations = len(locations)
     
+    # CORREÇÃO 2: Janela INFINITA para Vivenda
+    print(f"\n=== CONSTRUINDO JANELAS DE TEMPO ===")
     time_windows = [(0, MAX_TIME_HORIZON)]
+    vivenda_count = 0
+    
     for delivery in request.deliveries:
         customer = customer_map.get(delivery.customer_id)
-        if customer and customer.window_start is not None and customer.window_end is not None:
-            time_windows.append((customer.window_start, customer.window_end))
-        else:
+        customer_name = (delivery.customer_name or "").lower()
+        
+        # Verificar se é Vivenda
+        is_vivenda = vivenda_keyword and vivenda_keyword in customer_name
+        
+        if is_vivenda:
+            # JANELA INFINITA para Vivenda (ignora horário de fechamento)
             time_windows.append((0, MAX_TIME_HORIZON))
+            vivenda_count += 1
+            print(f"  Vivenda detectada: {delivery.customer_name} -> Janela INFINITA (0, {MAX_TIME_HORIZON})")
+        else:
+            # Janela normal do cliente
+            if customer and customer.window_start is not None and customer.window_end is not None:
+                time_windows.append((customer.window_start, customer.window_end))
+            else:
+                time_windows.append((0, MAX_TIME_HORIZON))
+    
+    if vivenda_count > 0:
+        print(f"  Total entregas Vivenda com janela infinita: {vivenda_count}")
     
     service_times = [0]
     for delivery in request.deliveries:
@@ -399,7 +418,7 @@ async def optimize_routes(request: OptimizeRequest):
         else:
             service_times.append(DEFAULT_SERVICE_TIME)
     
-    # ALTERAÇÃO 1: Criar dicionário para Fixed Driver
+    # CORREÇÃO 1: Criar dicionário para Fixed Driver
     fixed_assignments = {}
     
     rules_applied_count = 0
@@ -445,8 +464,9 @@ async def optimize_routes(request: OptimizeRequest):
                                     break
                         
                         if target_vehicle:
+                            # Armazenar para aplicar depois
                             fixed_assignments[delivery.id] = target_vehicle.id
-                            print(f"  ✅ {customer_name} → veículo {target_vehicle.id} (FORÇADO)")
+                            print(f"  ✅ {customer_name} → veículo {target_vehicle.id} (SERÁ FORÇADO)")
                             rules_applied_count += 1
             
             elif rule.type == "max_stops":
@@ -608,34 +628,22 @@ async def optimize_routes(request: OptimizeRequest):
     )
     time_dimension = routing.GetDimensionOrDie("Time")
     
-    # ALTERAÇÃO 2: Janela infinita para Vivenda
-    print(f"\n=== JANELAS DE TEMPO ===")
-    print(f"Flexibilidade configurada: {FLEXIBILITY_MINUTES}min")
-    print(f"Flexibilidade máxima (emergência): 60min")
-    
-    vivenda_keyword = optimization_config.vivenda_rule.keyword.lower() if optimization_config.vivenda_rule else "vivenda"
+    print(f"\n=== APLICANDO JANELAS NO SOLVER ===")
     
     for node in range(num_locations):
         index = manager.NodeToIndex(node)
         window_start, window_end = time_windows[node]
         
-        # Verificar se é entrega Vivenda
-        is_vivenda = False
-        if node > 0:
-            delivery = request.deliveries[node - 1]
-            customer_name = (delivery.customer_name or "").lower()
-            if vivenda_keyword in customer_name:
-                is_vivenda = True
-        
-        if is_vivenda:
-            # Janela infinita para Vivenda
-            time_dimension.CumulVar(index).SetRange(0, MAX_TIME_HORIZON)
-            print(f"  Node {node}: VIVENDA - Janela infinita (0, {MAX_TIME_HORIZON})")
-        else:
-            # Janelas flexíveis para não-Vivenda
+        # Aplicar flexibilidade apenas para não-Vivenda
+        if window_end < MAX_TIME_HORIZON:
             flexible_start = max(0, window_start - 60)
             flexible_end = min(MAX_TIME_HORIZON, window_end + 60)
-            time_dimension.CumulVar(index).SetRange(flexible_start, flexible_end)
+        else:
+            # Vivenda já tem janela infinita, manter como está
+            flexible_start = window_start
+            flexible_end = window_end
+        
+        time_dimension.CumulVar(index).SetRange(flexible_start, flexible_end)
     
     for vehicle_idx in range(num_vehicles):
         time_dimension.SetSpanCostCoefficientForVehicle(100, vehicle_idx)
@@ -693,7 +701,7 @@ async def optimize_routes(request: OptimizeRequest):
     if preferred_driver_count > 0:
         print(f"  Total preferências: {preferred_driver_count} (não obrigatórias)")
     
-    # ALTERAÇÃO 1 (continuação): Aplicar Fixed Driver assignments
+    # CORREÇÃO 1 (aplicação): Aplicar Fixed Driver assignments
     if fixed_assignments:
         print(f"\n=== APLICANDO FIXED DRIVER (RÍGIDO) ===")
         for delivery_id, vehicle_id in fixed_assignments.items():
@@ -996,12 +1004,12 @@ async def optimize_routes(request: OptimizeRequest):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.9.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "10.0"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "7.9.0"}
+    return {"status": "healthy", "version": "10.0"}
 
 
 if __name__ == "__main__":
