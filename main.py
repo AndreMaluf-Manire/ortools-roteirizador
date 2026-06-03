@@ -1,29 +1,29 @@
 """
-MicroserviÃ§o de OtimizaÃ§Ã£o de Rotas com OR-Tools
-Roteirizador ManirÃª / Fruleve
+Microserviço de Otimização de Rotas com OR-Tools
+Roteirizador Manirê / Fruleve
 
-VERSÃƒO 7.8.0 - GARANTIA DE 100% DE ALOCAÃ‡ÃƒO:
-- Penalidade EXTREMA para nÃ£o-atendimento (10 trilhÃµes)
-- Tempo de soluÃ§Ã£o aumentado para 300s (5 minutos)
-- Prioridade absoluta: alocar TODAS as entregas
-- Usar apenas veÃ­culos reais (sem veÃ­culos extras fantasma)
-- Soft time windows mais flexÃ­veis (30min)
-- Logs otimizados para evitar rate limit do Railway
-
-VERSÃƒO 7.5.0 - MOTORISTA PREFERENCIAL:
-- preferred_driver_id: Motorista preferencial do cliente (cadastro)
-- PrÃ©-atribuiÃ§Ã£o automÃ¡tica ao primeiro veÃ­culo do motorista
-
-VERSÃƒO 7.4.0 - NOVAS REGRAS DE ROTEAMENTO:
-- vehicle_exclusive_for_group: VeÃ­culo(s) exclusivo(s) para grupo especÃ­fico
-- force_multiple_vehicles: ForÃ§ar distribuiÃ§Ã£o em mÃºltiplos veÃ­culos
-- fixed_driver com mÃºltiplos veÃ­culos (vehicle_ids em action)
+VERSÃO 11.0 - PRECISÃO + ENCAIXA TODOS:
+- Lê a time_matrix REAL enviada pelo roteirizador (Google Distance Matrix),
+  com fallback Haversine por veículo quando não vier.
+- Velocidade por veículo aplicada como multiplicador sobre a matriz real
+  (ex.: veículo de estrada cobre mais rápido).
+- Capacidade de caixas contada POR CLIENTE (0,5 + 0,5 do mesmo cliente = 1 cx;
+  de clientes diferentes = 1 cx cada). Fim da inflação por arredondar cada linha.
+- Janelas SOFT de verdade: respeita a janela, usa a margem só quando precisa,
+  com penalidade suave de atraso (margem configurável via config).
+- "Encaixa todos": veículos de reserva (carro adicional) com custo alto, usados
+  só quando a frota real não fecha. DESLIGADO por padrão (config.allow_extra_vehicles).
+- Hierarquia de custos por tipo de veículo (própria < agregado pequeno < grande).
+- Vivenda configurável + exclusividade bidirecional (sem UUID hardcoded).
+- Fixed Driver rígido sem ser sobrescrito pela regra Vivenda.
+- /recalculate-etas PRESERVADO (recálculo só do que foi editado, sem solver).
+- Autenticação opcional por segredo compartilhado (só ativa se ORTOOLS_API_KEY existir).
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import os
@@ -32,37 +32,45 @@ import time
 
 app = FastAPI(
     title="OR-Tools Route Optimizer",
-    description="API de otimizaÃ§Ã£o de rotas para o Roteirizador ManirÃª",
-    version="7.8.0"
+    description="API de otimização de rotas para o Roteirizador Manirê",
+    version="11.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# API aberta - sem autenticaÃ§Ã£o
+# Autenticação opcional: só é exigida se a variável de ambiente existir.
+# Mantém compatibilidade com o fluxo atual (API aberta) enquanto não for configurada.
+ORTOOLS_API_KEY = os.getenv("ORTOOLS_API_KEY")
+
+
+def check_api_key(authorization: Optional[str]):
+    if not ORTOOLS_API_KEY:
+        return  # API aberta (comportamento atual)
+    expected = f"Bearer {ORTOOLS_API_KEY}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
 
 # Constantes
-DEFAULT_SPEED_KMH = 16.0
-MAX_TIME_HORIZON = 1440  # 24 horas em minutos
+DEFAULT_SPEED_KMH = 16.0          # velocidade de referência (base do multiplicador por veículo)
+MAX_TIME_HORIZON = 1440           # 24h em minutos
 DEFAULT_SERVICE_TIME = 15
+PENALTY_UNASSIGNED = 100_000_000_000_000   # 100 trilhões (último recurso: nunca deixar de fora)
+SOLUTION_TIME_LIMIT = 60
 
-# v7.8.0: Penalidade EXTREMA para garantir 100% de alocaÃ§Ã£o
-PENALTY_UNASSIGNED = 10_000_000_000_000  # 10 trilhÃµes
-SOLUTION_TIME_LIMIT = 60  # 1 minuto
-FLEXIBILITY_MINUTES = 30  # Flexibilidade de janela
-
-# v7.8.0: HARDCODE - Vivenda sempre nos 2 carros do Marcelo Mota
-# Esses veÃ­culos sÃ£o EXCLUSIVOS para entregas com "VIVENDA" no nome
-VIVENDA_VEHICLE_IDS = [
-    "a70ac53e-e466-4aac-8c98-07d5148f7e02",  # FIORINO (Marcelo Mota)
-    "5668e45f-bf68-40d7-b387-2c8d2e90a2c3",  # FIORINO EDU (Marcelo Mota)
-]
-VIVENDA_KEYWORD = "vivenda"  # Palavra-chave para identificar entregas Vivenda
+# Custos fixos por tipo de veículo (quanto menor, mais "barato"/preferido)
+COST_FROTA_PROPRIA = 500
+COST_AGREGADO_PEQUENO = 5_000
+COST_AGREGADO_GRANDE = 10_000
+# Carro adicional/reserva: bem mais caro que qualquer real, mas MUITO mais barato que
+# deixar cliente de fora -> o solver só adiciona um carro quando realmente precisa.
+COST_EXTRA_VEHICLE = 1_000_000
 
 
 # ============== MODELOS DE DADOS ==============
@@ -105,6 +113,9 @@ class Vehicle(BaseModel):
     capacity_kg: float = 99999
     average_speed_kmh: Optional[float] = None
     freteiro_id: Optional[str] = None
+    # Opcional: classificação explícita de custo vinda do cadastro.
+    # Valores: "propria" | "agregado_pequeno" | "agregado_grande".
+    cost_tier: Optional[str] = None
 
 
 class RoutingRuleCondition(BaseModel):
@@ -128,6 +139,24 @@ class RoutingRule(BaseModel):
     vehicle_ids: Optional[List[str]] = None
 
 
+class VivendaruleConfig(BaseModel):
+    enabled: bool = False
+    vehicle_ids: List[str] = []
+    keyword: str = "vivenda"
+    balance_mode: str = "volume"
+
+
+class OptimizationConfig(BaseModel):
+    soft_time_window_tolerance: int = 15          # margem (min) que a janela pode estourar
+    late_penalty_per_min: int = 50                # penalidade suave por minuto de atraso
+    vivenda_rule: Optional[VivendaruleConfig] = None
+    force_allocation: bool = True
+    # "Encaixa todos" com carro adicional — DESLIGADO por padrão (segurança).
+    allow_extra_vehicles: bool = False
+    extra_vehicles_count: int = 5                 # quantos carros de reserva podem entrar
+    extra_vehicle_capacity_boxes: int = 0         # 0 = auto (= maior capacidade da frota real)
+
+
 class OptimizeRequest(BaseModel):
     depot: Depot
     customers: List[Customer]
@@ -137,6 +166,11 @@ class OptimizeRequest(BaseModel):
     mode: str = "minimize_vehicles"
     delivery_groups: Optional[List[List[str]]] = None
     routing_rules: Optional[List[RoutingRule]] = None
+    config: Optional[OptimizationConfig] = None
+    # Matriz de tempo (minutos) já calculada pelo roteirizador (Google ou fallback).
+    # Ordem: [depot, ...customers] na MESMA ordem de `customers`.
+    time_matrix: Optional[List[List[int]]] = None
+    max_route_duration: Optional[int] = None      # informativo por enquanto
 
 
 class RouteStop(BaseModel):
@@ -171,6 +205,7 @@ class Route(BaseModel):
     total_time_minutes: int
     start_time: int
     end_time: int
+    is_extra_vehicle: bool = False   # True = carro adicional sugerido (não é da frota real)
 
 
 class OptimizeResponse(BaseModel):
@@ -182,9 +217,10 @@ class OptimizeResponse(BaseModel):
     total_deliveries: int
     total_value: float
     optimization_time_ms: int
+    extra_vehicles_used: int = 0     # quantos carros adicionais foram necessários
 
 
-# ============== FUNÃ‡Ã•ES AUXILIARES ==============
+# ============== FUNÇÕES AUXILIARES ==============
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371
@@ -192,10 +228,10 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     phi2 = math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
     delta_lambda = math.radians(lon2 - lon1)
-    
-    a = math.sin(delta_phi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    
+
+    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
     return R * c
 
 
@@ -208,7 +244,6 @@ def minutes_to_time(minutes: int) -> str:
 def create_time_matrix(locations: List[Location], speed_kmh: float) -> List[List[int]]:
     n = len(locations)
     matrix = [[0] * n for _ in range(n)]
-    
     for i in range(n):
         for j in range(n):
             if i != j:
@@ -216,24 +251,55 @@ def create_time_matrix(locations: List[Location], speed_kmh: float) -> List[List
                     locations[i].lat, locations[i].lng,
                     locations[j].lat, locations[j].lng
                 )
-                time_minutes = int(math.ceil((dist / speed_kmh) * 60))
-                matrix[i][j] = time_minutes
-    
+                matrix[i][j] = int(math.ceil((dist / speed_kmh) * 60))
     return matrix
 
 
-def create_time_matrix_per_vehicle(locations: List[Location], vehicles: List[Vehicle], default_speed: float) -> Dict[int, List[List[int]]]:
-    matrices = {}
+def scale_matrix(base: List[List[int]], factor: float) -> List[List[int]]:
+    """Escala uma matriz de tempos por um fator (para velocidade por veículo)."""
+    if abs(factor - 1.0) < 1e-9:
+        return [row[:] for row in base]
+    n = len(base)
+    return [[int(math.ceil(base[i][j] * factor)) for j in range(n)] for i in range(n)]
+
+
+def build_time_matrices(
+    locations: List[Location],
+    vehicles: List["Vehicle"],
+    provided_matrix: Optional[List[List[int]]],
+    default_speed: float,
+) -> (Dict[int, List[List[int]]], List[List[int]], bool):
+    """
+    Retorna (matrizes_por_veiculo, matriz_base, usou_matriz_real).
+    - Se veio time_matrix do roteirizador e bate o tamanho: usa ela como base (tempo real)
+      e aplica velocidade por veículo como multiplicador (referência = DEFAULT_SPEED_KMH).
+    - Senão: cai no Haversine por veículo (comportamento antigo).
+    """
+    n = len(locations)
+    used_real = False
+    base_matrix: List[List[int]]
+
+    if provided_matrix and len(provided_matrix) == n and all(len(r) == n for r in provided_matrix):
+        base_matrix = [[int(provided_matrix[i][j]) for j in range(n)] for i in range(n)]
+        used_real = True
+    else:
+        base_matrix = create_time_matrix(locations, default_speed)
+
+    matrices: Dict[int, List[List[int]]] = {}
     for idx, vehicle in enumerate(vehicles):
         speed = vehicle.average_speed_kmh if vehicle.average_speed_kmh else default_speed
-        matrices[idx] = create_time_matrix(locations, speed)
-    return matrices
+        if used_real:
+            # Matriz real é "carro normal" ~ default_speed. Veículo mais rápido -> tempos menores.
+            factor = default_speed / speed if speed else 1.0
+            matrices[idx] = scale_matrix(base_matrix, factor)
+        else:
+            matrices[idx] = create_time_matrix(locations, speed)
+    return matrices, base_matrix, used_real
 
 
 def create_distance_matrix(locations: List[Location]) -> List[List[float]]:
     n = len(locations)
     matrix = [[0.0] * n for _ in range(n)]
-    
     for i in range(n):
         for j in range(n):
             if i != j:
@@ -241,695 +307,479 @@ def create_distance_matrix(locations: List[Location]) -> List[List[float]]:
                     locations[i].lat, locations[i].lng,
                     locations[j].lat, locations[j].lng
                 )
-    
     return matrix
 
 
-# ============== OTIMIZAÃ‡ÃƒO ==============
+def classify_vehicle_cost(vehicle: Vehicle) -> int:
+    """
+    Custo fixo do veículo. Usa cost_tier explícito se vier do cadastro;
+    senão cai numa heurística por nome (menos confiável).
+    """
+    if vehicle.cost_tier:
+        tier = vehicle.cost_tier.strip().lower()
+        if tier == "propria":
+            return COST_FROTA_PROPRIA
+        if tier == "agregado_pequeno":
+            return COST_AGREGADO_PEQUENO
+        if tier == "agregado_grande":
+            return COST_AGREGADO_GRANDE
+
+    vehicle_name = (vehicle.name or "").upper()
+    vehicle_id = (vehicle.id or "").upper()
+
+    agregado_keywords = ['OUTROS', 'FRETEIRO', 'AGREGADO', 'TERCEIRO']
+    is_agregado = any(kw in vehicle_name or kw in vehicle_id for kw in agregado_keywords)
+    if not is_agregado:
+        return COST_FROTA_PROPRIA
+
+    agregado_grande_keywords = ['HR', 'IVECO', 'CAMINHÃO', 'CAMINHAO', 'VUC', 'TRUCK', '3/4', 'TOCO']
+    is_grande = any(kw in vehicle_name for kw in agregado_grande_keywords)
+    return COST_AGREGADO_GRANDE if is_grande else COST_AGREGADO_PEQUENO
+
+
+def apply_vivenda_rule(
+    deliveries: List[Delivery],
+    config: VivendaruleConfig,
+):
+    """Distribui entregas Vivenda nos veículos exclusivos (bin packing por volume/peso)."""
+    vivenda_deliveries = []
+    non_vivenda_deliveries = []
+    keyword = config.keyword.lower()
+
+    for delivery in deliveries:
+        customer_name = (delivery.customer_name or "").lower()
+        if keyword in customer_name:
+            vivenda_deliveries.append(delivery)
+        else:
+            non_vivenda_deliveries.append(delivery)
+
+    print(f"\n=== REGRA VIVENDA (EXCLUSIVIDADE BIDIRECIONAL) ===")
+    print(f"  Keyword: '{config.keyword}' | Veículos: {config.vehicle_ids}")
+    print(f"  Vivenda: {len(vivenda_deliveries)} | Não-Vivenda: {len(non_vivenda_deliveries)}")
+
+    if len(vivenda_deliveries) == 0:
+        return [], deliveries, set(config.vehicle_ids)
+    if len(config.vehicle_ids) == 0:
+        print("  ❌ Regra ativa sem veículos definidos!")
+        return vivenda_deliveries, non_vivenda_deliveries, set()
+
+    key_fn = (lambda d: d.weight_kg) if config.balance_mode == "weight" else (lambda d: d.boxes)
+    vivenda_deliveries.sort(key=key_fn, reverse=True)
+    vehicle_loads = {vid: 0.0 for vid in config.vehicle_ids}
+    for delivery in vivenda_deliveries:
+        lightest = min(vehicle_loads, key=vehicle_loads.get)
+        delivery.vehicle_id = lightest
+        vehicle_loads[lightest] += key_fn(delivery)
+    print(f"  Balanceamento ({config.balance_mode}): {[round(l, 1) for l in vehicle_loads.values()]}")
+
+    return vivenda_deliveries, non_vivenda_deliveries, set(config.vehicle_ids)
+
+
+# ============== OTIMIZAÇÃO ==============
 
 @app.post("/optimize", response_model=OptimizeResponse)
-async def optimize_routes(request: OptimizeRequest):
+async def optimize_routes(request: OptimizeRequest, authorization: Optional[str] = Header(None)):
+    check_api_key(authorization)
     start_time_ms = time.time() * 1000
-    
-    # API aberta - sem validaÃ§Ã£o de API key
-    
+
     print(f"\n{'='*60}")
-    print(f"=== OTIMIZAÃ‡ÃƒO v7.8.0 - GARANTIA 100% ALOCAÃ‡ÃƒO ===")
+    print(f"=== OTIMIZAÇÃO v11.0 - PRECISÃO + ENCAIXA TODOS ===")
     print(f"{'='*60}")
-    print(f"Depot: {request.depot.name}")
-    print(f"Entregas: {len(request.deliveries)}")
-    print(f"VeÃ­culos: {len(request.vehicles)}")
-    print(f"Modo: {request.mode}")
-    print(f"Penalidade nÃ£o-atendimento: {PENALTY_UNASSIGNED:,}")
-    print(f"Tempo limite soluÃ§Ã£o: {SOLUTION_TIME_LIMIT}s")
-    
+    print(f"Depot: {request.depot.name} | Entregas: {len(request.deliveries)} | Veículos: {len(request.vehicles)}")
+    print(f"Modo: {request.mode} | Penalidade não-atendimento: {PENALTY_UNASSIGNED:,}")
+
     if len(request.deliveries) == 0:
         return OptimizeResponse(
-            success=True,
-            message="Nenhuma entrega para otimizar",
-            routes=[],
-            unassigned_deliveries=[],
-            vehicles_used=0,
-            total_deliveries=0,
-            total_value=0,
-            optimization_time_ms=int(time.time() * 1000 - start_time_ms)
+            success=True, message="Nenhuma entrega para otimizar", routes=[],
+            unassigned_deliveries=[], vehicles_used=0, total_deliveries=0,
+            total_value=0, optimization_time_ms=int(time.time() * 1000 - start_time_ms)
         )
-    
-    # Velocidade padrÃ£o
+
+    cfg = request.config or OptimizationConfig()
+    margin = max(0, cfg.soft_time_window_tolerance)
+    print(f"Margem de janela: {margin}min | Atraso penalizado: {cfg.late_penalty_per_min}/min")
+    print(f"Carro adicional: {'LIGADO' if cfg.allow_extra_vehicles else 'desligado'}")
+
     default_speed = DEFAULT_SPEED_KMH
-    
-    # Criar mapa de clientes
     customer_map = {c.id: c for c in request.customers}
-    
-    # Preparar localizaÃ§Ãµes
+
+    # ===== REGRA VIVENDA =====
+    vivenda_deliveries = []
+    non_vivenda_deliveries = request.deliveries
+    vivenda_vehicle_set: Set[str] = set()
+    vivenda_keyword = ""
+    if cfg.vivenda_rule and cfg.vivenda_rule.enabled:
+        vivenda_keyword = cfg.vivenda_rule.keyword.lower()
+        vivenda_deliveries, non_vivenda_deliveries, vivenda_vehicle_set = apply_vivenda_rule(
+            request.deliveries, cfg.vivenda_rule
+        )
+    else:
+        print("\n=== REGRA VIVENDA: DESATIVADA ===")
+
+    # ===== LOCALIZAÇÕES =====
     locations = [request.depot.location]
     for delivery in request.deliveries:
         customer = customer_map.get(delivery.customer_id)
         if customer:
             locations.append(customer.location)
         else:
+            # Cliente ausente no cadastro: avisa e usa depot (não silencioso).
+            print(f"  ⚠️ Cliente não encontrado para entrega {delivery.id} (customer_id={delivery.customer_id}) — usando depot")
             locations.append(Location(lat=request.depot.location.lat, lng=request.depot.location.lng))
-    
     num_locations = len(locations)
-    
-    # Preparar janelas de tempo
-    time_windows = [(0, MAX_TIME_HORIZON)]
-    for delivery in request.deliveries:
-        customer = customer_map.get(delivery.customer_id)
-        if customer and customer.window_start is not None and customer.window_end is not None:
-            time_windows.append((customer.window_start, customer.window_end))
-        else:
-            time_windows.append((0, MAX_TIME_HORIZON))
-    
-    # Preparar tempos de serviÃ§o
-    service_times = [0]
-    for delivery in request.deliveries:
-        customer = customer_map.get(delivery.customer_id)
-        if customer:
-            service_times.append(customer.service_time)
-        else:
-            service_times.append(DEFAULT_SERVICE_TIME)
-    
-    # ===== PROCESSAR REGRAS DE ROTEAMENTO =====
-    rules_applied_count = 0
+
+    # ===== JANELA INFINITA (Vivenda + Fixed Driver) =====
+    infinite_window_ids: Set[str] = set()
+    if vivenda_keyword:
+        for delivery in request.deliveries:
+            if vivenda_keyword in (delivery.customer_name or "").lower():
+                infinite_window_ids.add(delivery.id)
+
+    # ===== REGRAS DE ROTEAMENTO =====
+    fixed_assignments: Dict[str, str] = {}   # delivery_id -> vehicle_id (rígido)
     if request.routing_rules:
-        print(f"\n=== PROCESSANDO REGRAS DE ROTEAMENTO ===")
-        print(f"Total de regras recebidas: {len(request.routing_rules)}")
-        
-        sorted_rules = sorted(request.routing_rules, key=lambda r: r.priority, reverse=True)
-        
-        for rule in sorted_rules:
-            print(f"\nAplicando regra: {rule.type} (prioridade: {rule.priority})")
-            
+        print(f"\n=== REGRAS DE ROTEAMENTO ({len(request.routing_rules)}) ===")
+        for rule in sorted(request.routing_rules, key=lambda r: r.priority, reverse=True):
             if rule.type == "fixed_driver":
-                if not rule.action or not rule.action.freteiro_id:
-                    print(f"  âš ï¸ Regra sem freteiro_id, pulando")
+                if not rule.action or not rule.action.freteiro_id or not rule.condition:
                     continue
-                
                 freteiro_id = rule.action.freteiro_id
-                target_vehicle_ids = rule.action.vehicle_ids if rule.action.vehicle_ids else None
-                
-                print(f"  CondiÃ§Ã£o: {rule.condition.field} {rule.condition.operator} '{rule.condition.value}'")
-                
+                target_vehicle_ids = rule.action.vehicle_ids or None
                 for delivery in request.deliveries:
                     if delivery.vehicle_id:
                         continue
-                    
-                    customer_name = delivery.customer_name or ""
-                    matches = False
-                    
-                    if rule.condition.operator == "contains":
-                        matches = rule.condition.value.lower() in customer_name.lower()
-                    elif rule.condition.operator == "starts_with":
-                        matches = customer_name.lower().startswith(rule.condition.value.lower())
-                    elif rule.condition.operator == "equals":
-                        matches = customer_name.lower() == rule.condition.value.lower()
-                    
+                    cname = (delivery.customer_name or "").lower()
+                    val = rule.condition.value.lower()
+                    op = rule.condition.operator
+                    matches = (
+                        (op == "contains" and val in cname) or
+                        (op == "starts_with" and cname.startswith(val)) or
+                        (op == "equals" and cname == val)
+                    )
                     if matches:
-                        target_vehicle = None
-                        for v in request.vehicles:
-                            if v.freteiro_id == freteiro_id:
-                                if target_vehicle_ids is None or v.id in target_vehicle_ids:
-                                    target_vehicle = v
-                                    break
-                        
+                        target_vehicle = next(
+                            (v for v in request.vehicles
+                             if v.freteiro_id == freteiro_id and (target_vehicle_ids is None or v.id in target_vehicle_ids)),
+                            None
+                        )
                         if target_vehicle:
-                            # v7.8.0: NÃƒO atribuir vehicle_id diretamente (evita restriÃ§Ã£o rÃ­gida)
-                            # Apenas logar a preferÃªncia - o OR-Tools vai tentar respeitar
-                            print(f"  âœ… {customer_name} â†’ veÃ­culo {target_vehicle.id} (preferÃªncia)")
-                            rules_applied_count += 1
-            
-            elif rule.type == "max_stops":
-                if rule.action and rule.action.max_stops:
-                    print(f"  MÃ¡ximo de paradas: {rule.action.max_stops}")
-                    rules_applied_count += 1
-            
+                            fixed_assignments[delivery.id] = target_vehicle.id
+                            infinite_window_ids.add(delivery.id)
+
             elif rule.type == "group_by_name":
                 if not rule.condition:
                     continue
-                
-                group_deliveries = []
+                group = []
                 for delivery in request.deliveries:
-                    customer_name = delivery.customer_name or ""
-                    matches = False
-                    
-                    if rule.condition.operator == "contains":
-                        matches = rule.condition.value.lower() in customer_name.lower()
-                    elif rule.condition.operator == "starts_with":
-                        matches = customer_name.lower().startswith(rule.condition.value.lower())
-                    elif rule.condition.operator == "equals":
-                        matches = customer_name.lower() == rule.condition.value.lower()
-                    
-                    if matches:
-                        group_deliveries.append(delivery.id)
-                
-                if len(group_deliveries) > 1:
-                    if not request.delivery_groups:
-                        request.delivery_groups = []
-                    request.delivery_groups.append(group_deliveries)
-                    print(f"  âœ… Agrupadas {len(group_deliveries)} entregas")
-                    rules_applied_count += 1
-            
-            elif rule.type == "vehicle_exclusive_for_group":
-                if not rule.vehicle_ids or len(rule.vehicle_ids) == 0:
-                    continue
-                
-                print(f"  VeÃ­culos exclusivos: {len(rule.vehicle_ids)} veÃ­culos")
-                
-                allowed_delivery_ids = set()
-                for delivery in request.deliveries:
-                    customer_name = delivery.customer_name or ""
-                    matches = False
-                    
-                    if rule.condition and rule.condition.operator == "contains":
-                        matches = rule.condition.value.lower() in customer_name.lower()
-                    elif rule.condition and rule.condition.operator == "starts_with":
-                        matches = customer_name.lower().startswith(rule.condition.value.lower())
-                    elif rule.condition and rule.condition.operator == "equals":
-                        matches = customer_name.lower() == rule.condition.value.lower()
-                    
-                    if matches:
-                        allowed_delivery_ids.add(delivery.id)
-                
-                print(f"  Entregas permitidas: {len(allowed_delivery_ids)}")
-                
-                if not hasattr(request, 'vehicle_exclusive_rules'):
-                    request.vehicle_exclusive_rules = []
-                request.vehicle_exclusive_rules.append({
-                    'vehicle_ids': rule.vehicle_ids,
-                    'allowed_delivery_ids': allowed_delivery_ids
-                })
-                rules_applied_count += 1
-            
-            elif rule.type == "force_multiple_vehicles":
-                if not rule.vehicle_ids or len(rule.vehicle_ids) < 2:
-                    continue
-                
-                matched_deliveries = []
-                for delivery in request.deliveries:
-                    customer_name = delivery.customer_name or ""
-                    matches = False
-                    
-                    if rule.condition and rule.condition.operator == "contains":
-                        matches = rule.condition.value.lower() in customer_name.lower()
-                    elif rule.condition and rule.condition.operator == "starts_with":
-                        matches = customer_name.lower().startswith(rule.condition.value.lower())
-                    elif rule.condition and rule.condition.operator == "equals":
-                        matches = customer_name.lower() == rule.condition.value.lower()
-                    
-                    if matches:
-                        matched_deliveries.append(delivery)
-                
-                if len(matched_deliveries) >= 2:
-                    # v7.8.0: NÃƒO atribuir vehicle_id diretamente (evita restriÃ§Ã£o rÃ­gida)
-                    # Apenas logar a preferÃªncia
-                    print(f"  âœ… {len(matched_deliveries)} entregas identificadas para {len(rule.vehicle_ids)} veÃ­culos (preferÃªncia)")
-                    rules_applied_count += 1
-        
-        print(f"\nRegras aplicadas: {rules_applied_count}")
-    
-    # ===== v7.8.0: HARDCODE VIVENDA/MARCELO MOTA =====
-    # Identificar entregas Vivenda e distribuÃ­-las nos 2 FIORINOs
-    print(f"\n=== HARDCODE VIVENDA (v7.8.0) ===")
-    vivenda_deliveries = []
-    non_vivenda_deliveries = []
-    
+                    cname = (delivery.customer_name or "").lower()
+                    val = rule.condition.value.lower()
+                    op = rule.condition.operator
+                    if (op == "contains" and val in cname) or \
+                       (op == "starts_with" and cname.startswith(val)) or \
+                       (op == "equals" and cname == val):
+                        group.append(delivery.id)
+                if len(group) > 1:
+                    request.delivery_groups = (request.delivery_groups or []) + [group]
+        print(f"  Fixed Driver: {len(fixed_assignments)} entrega(s) travada(s)")
+
+    # ===== JANELAS DE TEMPO =====
+    time_windows = [(0, MAX_TIME_HORIZON)]
     for delivery in request.deliveries:
-        customer_name = (delivery.customer_name or "").lower()
-        if VIVENDA_KEYWORD in customer_name:
-            vivenda_deliveries.append(delivery)
+        customer = customer_map.get(delivery.customer_id)
+        if delivery.id in infinite_window_ids:
+            time_windows.append((0, MAX_TIME_HORIZON))
+        elif customer and customer.window_start is not None and customer.window_end is not None:
+            time_windows.append((customer.window_start, customer.window_end))
         else:
-            non_vivenda_deliveries.append(delivery)
-    
-    print(f"  Entregas VIVENDA encontradas: {len(vivenda_deliveries)}")
-    print(f"  Entregas NÃƒO-VIVENDA: {len(non_vivenda_deliveries)}")
-    
-    # Distribuir Vivendas entre os 2 veÃ­culos (round-robin)
-    vivenda_assigned = 0
-    for idx, delivery in enumerate(vivenda_deliveries):
-        vehicle_idx = idx % len(VIVENDA_VEHICLE_IDS)
-        delivery.vehicle_id = VIVENDA_VEHICLE_IDS[vehicle_idx]
-        vivenda_assigned += 1
-        print(f"    {delivery.customer_name} -> VeÃ­culo {vehicle_idx + 1} (FIORINO)")
-    
-    print(f"  Total VIVENDA distribuÃ­das: {vivenda_assigned} em {len(VIVENDA_VEHICLE_IDS)} veÃ­culos")
-    
-    # Marcar veÃ­culos Vivenda como exclusivos (para nÃ£o receber outras entregas)
-    vivenda_vehicle_set = set(VIVENDA_VEHICLE_IDS)
-    
-    # ===== CONFIGURAR VEÃCULOS =====
-    # v7.8.0: USAR APENAS VEÃCULOS REAIS - sem veÃ­culos extras!
-    num_vehicles = len(request.vehicles)
-    vehicles = list(request.vehicles)
-    
-    print(f"\n=== VEÃCULOS ===")
-    print(f"Total de veÃ­culos REAIS: {num_vehicles}")
-    
-    if num_vehicles == 0:
+            time_windows.append((0, MAX_TIME_HORIZON))
+
+    service_times = [0]
+    for delivery in request.deliveries:
+        customer = customer_map.get(delivery.customer_id)
+        service_times.append(customer.service_time if customer else DEFAULT_SERVICE_TIME)
+
+    # ===== VEÍCULOS (reais + reserva opcional) =====
+    if len(request.vehicles) == 0:
         return OptimizeResponse(
-            success=False,
-            message="Nenhum veÃ­culo disponÃ­vel",
-            routes=[],
-            unassigned_deliveries=[d.id for d in request.deliveries],
-            vehicles_used=0,
-            total_deliveries=len(request.deliveries),
-            total_value=0,
+            success=False, message="Nenhum veículo disponível", routes=[],
+            unassigned_deliveries=[d.id for d in request.deliveries], vehicles_used=0,
+            total_deliveries=len(request.deliveries), total_value=0,
             optimization_time_ms=int(time.time() * 1000 - start_time_ms)
         )
-    
-    for idx, v in enumerate(vehicles):
-        speed = v.average_speed_kmh if v.average_speed_kmh else default_speed
-        print(f"  {idx+1}. {v.name}: {v.capacity_boxes} caixas, {speed} km/h")
-    
-    # Criar matrizes de tempo por veÃ­culo
-    time_matrices = create_time_matrix_per_vehicle(locations, vehicles, default_speed)
+
+    vehicles: List[Vehicle] = list(request.vehicles)
+    num_real_vehicles = len(vehicles)
+
+    extra_vehicle_ids: Set[str] = set()
+    if cfg.allow_extra_vehicles and cfg.extra_vehicles_count > 0:
+        extra_cap = cfg.extra_vehicle_capacity_boxes or max((v.capacity_boxes for v in request.vehicles), default=999)
+        for i in range(cfg.extra_vehicles_count):
+            vid = f"EXTRA-{i+1}"
+            extra_vehicle_ids.add(vid)
+            vehicles.append(Vehicle(
+                id=vid, name=f"🚐 CARRO ADICIONAL {i+1}",
+                capacity_boxes=int(extra_cap), capacity_kg=99999,
+                average_speed_kmh=default_speed, cost_tier="agregado_grande"
+            ))
+        print(f"\n=== CARROS DE RESERVA: {cfg.extra_vehicles_count} (cap {extra_cap} cx, custo {COST_EXTRA_VEHICLE:,}) ===")
+
+    num_vehicles = len(vehicles)
+
+    # Custos por veículo (real = hierarquia; extra = custo alto)
+    vehicle_costs = []
+    for v in vehicles:
+        vehicle_costs.append(COST_EXTRA_VEHICLE if v.id in extra_vehicle_ids else classify_vehicle_cost(v))
+
+    # ===== MATRIZES =====
+    time_matrices, base_time_matrix, used_real = build_time_matrices(
+        locations, vehicles, request.time_matrix, default_speed
+    )
+    print(f"Matriz de tempo: {'REAL (roteirizador)' if used_real else 'Haversine (fallback)'}")
     distance_matrix = create_distance_matrix(locations)
-    
-    # Mapear delivery_id para node_index
-    delivery_id_to_node = {}
-    for idx, delivery in enumerate(request.deliveries):
-        delivery_id_to_node[delivery.id] = idx + 1
-    
-    # Mapear vehicle_id para vehicle_idx
-    vehicle_id_to_idx = {}
-    for idx, vehicle in enumerate(vehicles):
-        vehicle_id_to_idx[vehicle.id] = idx
-    
-    # ===== CRIAR MODELO OR-TOOLS =====
+
+    delivery_id_to_node = {d.id: i + 1 for i, d in enumerate(request.deliveries)}
+    vehicle_id_to_idx = {v.id: i for i, v in enumerate(vehicles)}
+
+    # ===== DEMANDA (CAIXAS POR CLIENTE) =====
+    # 0,5 + 0,5 do MESMO cliente = 1; de clientes diferentes = 1 cada.
+    customer_total_boxes: Dict[str, float] = {}
+    for d in request.deliveries:
+        customer_total_boxes[d.customer_id] = customer_total_boxes.get(d.customer_id, 0.0) + (d.boxes or 0)
+    node_demand = [0] * num_locations
+    seen_customers: Set[str] = set()
+    for idx, d in enumerate(request.deliveries):
+        node = idx + 1
+        if d.customer_id not in seen_customers:
+            seen_customers.add(d.customer_id)
+            node_demand[node] = int(math.ceil(customer_total_boxes[d.customer_id]))
+        else:
+            node_demand[node] = 0  # caixas já contadas na 1ª parada do cliente
+
+    # ===== MODELO OR-TOOLS =====
     manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
-    
-    # ----- CALLBACKS DE TEMPO POR VEÃCULO -----
+
     def make_time_callback(vehicle_idx):
-        time_matrix = time_matrices.get(vehicle_idx, time_matrices[0])
-        def time_callback(from_index, to_index):
-            from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            travel = time_matrix[from_node][to_node]
-            service = service_times[to_node] if to_node > 0 else 0
-            return travel + service
-        return time_callback
-    
+        tm = time_matrices.get(vehicle_idx, base_time_matrix)
+        def cb(from_index, to_index):
+            fn = manager.IndexToNode(from_index)
+            tn = manager.IndexToNode(to_index)
+            return tm[fn][tn] + (service_times[tn] if tn > 0 else 0)
+        return cb
+
     time_callback_indices = []
     for vehicle_idx in range(num_vehicles):
-        callback = make_time_callback(vehicle_idx)
-        callback_index = routing.RegisterTransitCallback(callback)
-        time_callback_indices.append(callback_index)
-    
-    # ----- DIMENSÃƒO DE TEMPO COM TIME WINDOWS -----
-    base_time_matrix = time_matrices.get(0, create_time_matrix(locations, default_speed))
-    
+        time_callback_indices.append(routing.RegisterTransitCallback(make_time_callback(vehicle_idx)))
+
     def base_time_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        travel = base_time_matrix[from_node][to_node]
-        service = service_times[to_node] if to_node > 0 else 0
-        return travel + service
-    
+        fn = manager.IndexToNode(from_index)
+        tn = manager.IndexToNode(to_index)
+        return base_time_matrix[fn][tn] + (service_times[tn] if tn > 0 else 0)
+
     base_time_callback_index = routing.RegisterTransitCallback(base_time_callback)
-    
-    routing.AddDimension(
-        base_time_callback_index,
-        MAX_TIME_HORIZON,
-        MAX_TIME_HORIZON,
-        False,
-        "Time"
-    )
+
+    routing.AddDimension(base_time_callback_index, MAX_TIME_HORIZON, MAX_TIME_HORIZON, False, "Time")
     time_dimension = routing.GetDimensionOrDie("Time")
-    
-    # v7.8.0: Janelas de tempo mais flexÃ­veis (30min)
-    print(f"\n=== JANELAS DE TEMPO (flexibilidade: {FLEXIBILITY_MINUTES}min) ===")
+
+    # Janelas: range rígido [ws-margem, we+margem]; penalidade suave após we (atraso só se precisar).
     for node in range(num_locations):
         index = manager.NodeToIndex(node)
-        window_start, window_end = time_windows[node]
-        
-        flexible_start = max(0, window_start - FLEXIBILITY_MINUTES)
-        flexible_end = min(MAX_TIME_HORIZON, window_end + FLEXIBILITY_MINUTES)
-        
-        time_dimension.CumulVar(index).SetRange(flexible_start, flexible_end)
-    
-    # Penalidade por atraso
+        ws, we = time_windows[node]
+        if we < MAX_TIME_HORIZON:
+            time_dimension.CumulVar(index).SetRange(max(0, ws - margin), min(MAX_TIME_HORIZON, we + margin))
+            if cfg.late_penalty_per_min > 0:
+                time_dimension.SetCumulVarSoftUpperBound(index, we, cfg.late_penalty_per_min)
+        else:
+            time_dimension.CumulVar(index).SetRange(ws, we)
+
     for vehicle_idx in range(num_vehicles):
-        time_dimension.SetSpanCostCoefficientForVehicle(5000, vehicle_idx)
-    
-    # HorÃ¡rio de inÃ­cio
-    for vehicle_idx in range(num_vehicles):
+        time_dimension.SetSpanCostCoefficientForVehicle(100, vehicle_idx)
         start_index = routing.Start(vehicle_idx)
         time_dimension.CumulVar(start_index).SetRange(request.start_time, request.start_time)
-    
-    # ----- CALLBACK DE CAPACIDADE -----
+
+    # Capacidade (caixas por cliente)
     def demand_callback(from_index):
-        from_node = manager.IndexToNode(from_index)
-        if from_node == 0:
-            return 0
-        delivery = request.deliveries[from_node - 1]
-        return int(math.ceil(delivery.boxes))
-    
+        return node_demand[manager.IndexToNode(from_index)]
+
     demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-    
     routing.AddDimensionWithVehicleCapacity(
-        demand_callback_index,
-        0,
-        [v.capacity_boxes for v in vehicles],
-        True,
-        "Capacity"
+        demand_callback_index, 0, [v.capacity_boxes for v in vehicles], True, "Capacity"
     )
-    
-    # ----- CUSTOS POR VEÃCULO -----
+
+    # Custos por veículo (arco = tempo; fixo = hierarquia/reserva)
     for vehicle_idx in range(num_vehicles):
         routing.SetArcCostEvaluatorOfVehicle(time_callback_indices[vehicle_idx], vehicle_idx)
-    
-    # v7.8.0: Custo fixo MENOR para nÃ£o penalizar uso de mais veÃ­culos
-    # Prioridade Ã© alocar TODAS as entregas, nÃ£o minimizar veÃ­culos
-    for vehicle_idx in range(num_vehicles):
-        routing.SetFixedCostOfVehicle(1000, vehicle_idx)  # Custo baixo
-    
-    # ----- MOTORISTA PREFERENCIAL (PREFERÃŠNCIA SUAVE) -----
-    # v7.8.0: Motorista preferencial agora Ã© PREFERÃŠNCIA, nÃ£o OBRIGATÃ“RIO
-    # Isso evita que entregas fiquem pendentes quando o veÃ­culo preferencial nÃ£o tem capacidade
-    print(f"\n=== PREFERÃŠNCIAS DE MOTORISTA ===")
-    preferred_driver_count = 0
-    preferred_assignments = {}  # node -> vehicle_idx
-    
-    for delivery in request.deliveries:
-        if delivery.vehicle_id:
-            continue
-        
-        if delivery.preferred_driver_id:
-            preferred_vehicle_idx = None
-            for idx, vehicle in enumerate(vehicles):
-                if vehicle.freteiro_id == delivery.preferred_driver_id:
-                    preferred_vehicle_idx = idx
-                    break
-            
-            if preferred_vehicle_idx is not None:
-                node = delivery_id_to_node[delivery.id]
-                preferred_assignments[node] = preferred_vehicle_idx
-                preferred_driver_count += 1
-                customer = customer_map.get(delivery.customer_id)
-                customer_name = customer.name if customer else "?"
-                print(f"  PreferÃªncia: {customer_name} -> {vehicles[preferred_vehicle_idx].name} (suave)")
-    
-    if preferred_driver_count > 0:
-        print(f"  Total preferÃªncias: {preferred_driver_count} (nÃ£o obrigatÃ³rias)")
-    
-    # ----- v7.8.0: PRÃ‰-ATRIBUIÃ‡ÃƒO VIVENDA (RÃGIDA) -----
-    # Vivenda Ã© FORÃ‡ADA nos veÃ­culos do Marcelo Mota
-    print(f"\n=== PRÃ‰-ATRIBUIÃ‡ÃƒO VIVENDA (RÃGIDA) ===")
-    vivenda_pre_assigned = 0
-    
-    # Identificar Ã­ndices dos veÃ­culos Vivenda
-    vivenda_vehicle_indices = []
-    for vid in VIVENDA_VEHICLE_IDS:
-        if vid in vehicle_id_to_idx:
-            vivenda_vehicle_indices.append(vehicle_id_to_idx[vid])
-    
-    print(f"  VeÃ­culos VIVENDA (Marcelo Mota): {len(vivenda_vehicle_indices)} encontrados")
-    
-    for delivery in request.deliveries:
-        customer_name = (delivery.customer_name or "").lower()
-        
-        # Se Ã© VIVENDA, forÃ§ar nos veÃ­culos do Marcelo Mota
-        if VIVENDA_KEYWORD in customer_name:
+        routing.SetFixedCostOfVehicle(vehicle_costs[vehicle_idx], vehicle_idx)
+
+    # ===== VIVENDA: exclusividade bidirecional =====
+    if vivenda_deliveries and vivenda_vehicle_set:
+        vivenda_idx = [vehicle_id_to_idx[v] for v in vivenda_vehicle_set if v in vehicle_id_to_idx]
+        if not vivenda_idx:
+            return OptimizeResponse(
+                success=False, message="Veículos da regra Vivenda não existem na frota configurada",
+                routes=[], unassigned_deliveries=[d.id for d in request.deliveries], vehicles_used=0,
+                total_deliveries=len(request.deliveries), total_value=0,
+                optimization_time_ms=int(time.time() * 1000 - start_time_ms)
+            )
+        for delivery in vivenda_deliveries:
             if delivery.vehicle_id and delivery.vehicle_id in vehicle_id_to_idx:
-                node = delivery_id_to_node[delivery.id]
-                vehicle_idx = vehicle_id_to_idx[delivery.vehicle_id]
-                index = manager.NodeToIndex(node)
-                routing.SetAllowedVehiclesForIndex([vehicle_idx], index)
-                vivenda_pre_assigned += 1
-                print(f"  VIVENDA FORÃ‡ADA: {delivery.customer_name} -> {vehicles[vehicle_idx].name}")
-    
-    print(f"  Total VIVENDA forÃ§adas: {vivenda_pre_assigned}")
-    
-    # ----- v7.8.0: EXCLUSIVIDADE DOS VEÃCULOS VIVENDA -----
-    # VeÃ­culos do Marcelo Mota sÃ³ aceitam VIVENDA
-    print(f"\n=== EXCLUSIVIDADE VEÃCULOS VIVENDA ===")
-    exclusivity_applied = 0
-    
-    # Identificar entregas nÃ£o-Vivenda
-    non_vivenda_vehicle_indices = [i for i in range(num_vehicles) if i not in vivenda_vehicle_indices]
-    
-    for delivery in request.deliveries:
-        customer_name = (delivery.customer_name or "").lower()
-        
-        # Se NÃƒO Ã© VIVENDA, proibir nos veÃ­culos do Marcelo Mota
-        if VIVENDA_KEYWORD not in customer_name:
-            node = delivery_id_to_node[delivery.id]
-            index = manager.NodeToIndex(node)
-            if non_vivenda_vehicle_indices:
-                routing.SetAllowedVehiclesForIndex(non_vivenda_vehicle_indices, index)
-                exclusivity_applied += 1
-    
-    print(f"  Entregas nÃ£o-VIVENDA bloqueadas dos FIORINOs: {exclusivity_applied}")
-    print(f"  VeÃ­culos disponÃ­veis para nÃ£o-VIVENDA: {len(non_vivenda_vehicle_indices)}")
-    
-    # ----- OUTRAS PRÃ‰-ATRIBUIÃ‡Ã•ES (SUAVES) -----
-    pre_assigned_count = 0
-    for delivery in request.deliveries:
-        customer_name = (delivery.customer_name or "").lower()
-        # Pular Vivendas (jÃ¡ foram tratadas)
-        if VIVENDA_KEYWORD in customer_name:
-            continue
-        if delivery.vehicle_id and delivery.vehicle_id in vehicle_id_to_idx:
-            pre_assigned_count += 1
-            customer = customer_map.get(delivery.customer_id)
-            cname = customer.name if customer else "?"
-            vehicle_idx = vehicle_id_to_idx[delivery.vehicle_id]
-            print(f"  PreferÃªncia (suave): {cname} -> {vehicles[vehicle_idx].name}")
-    
-    if pre_assigned_count > 0:
-        print(f"  Total preferÃªncias suaves: {pre_assigned_count}")
-    
-    # ----- GRUPOS DE ENTREGAS -----
+                index = manager.NodeToIndex(delivery_id_to_node[delivery.id])
+                routing.SetAllowedVehiclesForIndex([vehicle_id_to_idx[delivery.vehicle_id]], index)
+        # Não-Vivenda: proibir nos veículos exclusivos — exceto fixed drivers (não sobrescrever).
+        non_vivenda_idx = [i for i in range(num_vehicles) if i not in vivenda_idx]
+        if non_vivenda_idx:
+            for delivery in non_vivenda_deliveries:
+                if delivery.id in fixed_assignments:
+                    continue
+                index = manager.NodeToIndex(delivery_id_to_node[delivery.id])
+                routing.SetAllowedVehiclesForIndex(non_vivenda_idx, index)
+        else:
+            print("  ⚠️ TODOS os veículos são Vivenda — não-Vivenda podem ficar órfãs")
+
+    # ===== FIXED DRIVER (rígido) — aplicado por último para não ser sobrescrito =====
+    if fixed_assignments:
+        for delivery_id, vehicle_id in fixed_assignments.items():
+            if delivery_id in delivery_id_to_node and vehicle_id in vehicle_id_to_idx:
+                index = manager.NodeToIndex(delivery_id_to_node[delivery_id])
+                routing.SetAllowedVehiclesForIndex([vehicle_id_to_idx[vehicle_id]], index)
+
+    # ===== GRUPOS DE ENTREGAS (mesmo veículo) =====
     if request.delivery_groups:
-        print(f"\n=== GRUPOS DE ENTREGAS ===")
-        for group_idx, group in enumerate(request.delivery_groups):
-            if len(group) < 2:
-                continue
-            
-            group_nodes = []
-            for delivery_id in group:
-                if delivery_id in delivery_id_to_node:
-                    group_nodes.append(delivery_id_to_node[delivery_id])
-            
-            if len(group_nodes) >= 2:
-                first_node = group_nodes[0]
-                first_index = manager.NodeToIndex(first_node)
-                
-                for node in group_nodes[1:]:
-                    index = manager.NodeToIndex(node)
-                    routing.solver().Add(
-                        routing.VehicleVar(first_index) == routing.VehicleVar(index)
-                    )
-                
-                print(f"  Grupo {group_idx + 1}: {len(group_nodes)} entregas vinculadas")
-    
-    # ----- RESTRIÃ‡Ã•ES DE EXCLUSIVIDADE -----
-    # v7.8.0: REMOVIDO - NÃ£o usar restriÃ§Ãµes rÃ­gidas
-    # Exclusividade de veÃ­culos foi desativada para garantir 100% de alocaÃ§Ã£o
-    if hasattr(request, 'vehicle_exclusive_rules') and request.vehicle_exclusive_rules:
-        print(f"\n=== EXCLUSIVIDADE (DESATIVADA v7.8.0) ===")
-        print(f"  {len(request.vehicle_exclusive_rules)} regras de exclusividade ignoradas")
-        print(f"  Motivo: Prioridade Ã© alocar 100% das entregas")
-    
-    # ----- PENALIDADES v7.8.0 -----
-    # Penalidade EXTREMA para garantir 100% de alocaÃ§Ã£o
-    print(f"\n=== PENALIDADES ===")
-    print(f"Penalidade por nÃ£o-atendimento: {PENALTY_UNASSIGNED:,}")
-    
+        for group in request.delivery_groups:
+            nodes = [delivery_id_to_node[d] for d in group if d in delivery_id_to_node]
+            if len(nodes) >= 2:
+                first = manager.NodeToIndex(nodes[0])
+                for n in nodes[1:]:
+                    routing.solver().Add(routing.VehicleVar(first) == routing.VehicleVar(manager.NodeToIndex(n)))
+
+    # ===== PENALIDADE: nunca deixar de fora (último recurso) =====
     for node in range(1, num_locations):
         routing.AddDisjunction([manager.NodeToIndex(node)], PENALTY_UNASSIGNED)
-    
-    # ----- PARÃ‚METROS DE BUSCA v7.8.0 -----
+
+    # ===== RESOLVER =====
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    )
-    search_parameters.local_search_metaheuristic = (
-        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    )
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     search_parameters.time_limit.FromSeconds(SOLUTION_TIME_LIMIT)
-    
+
     print(f"\n=== RESOLVENDO (limite: {SOLUTION_TIME_LIMIT}s) ===")
-    
-    # ----- RESOLVER -----
     solution = routing.SolveWithParameters(search_parameters)
-    
+
     if not solution:
-        print("ERRO: NÃ£o encontrou soluÃ§Ã£o!")
+        print("ERRO: Não encontrou solução!")
         return OptimizeResponse(
             success=False,
-            message="NÃ£o foi possÃ­vel encontrar uma soluÃ§Ã£o. Verifique janelas de tempo e capacidades.",
-            routes=[],
-            unassigned_deliveries=[d.id for d in request.deliveries],
-            vehicles_used=0,
-            total_deliveries=len(request.deliveries),
-            total_value=0,
+            message="Não foi possível encontrar uma solução. Verifique janelas de tempo e capacidades.",
+            routes=[], unassigned_deliveries=[d.id for d in request.deliveries], vehicles_used=0,
+            total_deliveries=len(request.deliveries), total_value=0,
             optimization_time_ms=int(time.time() * 1000 - start_time_ms)
         )
-    
-    print("âœ… SoluÃ§Ã£o encontrada!")
-    
-    # ===== EXTRAIR SOLUÃ‡ÃƒO =====
+
+    print("✅ Solução encontrada!")
+
+    # ===== EXTRAIR SOLUÇÃO =====
     routes = []
     vehicles_used = 0
-    total_value_all = 0
-    all_assigned_deliveries = set()
-    
+    extra_vehicles_used = 0
+    total_value_all = 0.0
+    all_assigned = set()
+
     for vehicle_idx in range(num_vehicles):
         index = routing.Start(vehicle_idx)
-        
         route_nodes = []
         while not routing.IsEnd(index):
             node = manager.IndexToNode(index)
             if node > 0:
                 route_nodes.append(node)
             index = solution.Value(routing.NextVar(index))
-        
         if not route_nodes:
             continue
-        
+
         vehicle = vehicles[vehicle_idx]
-        vehicle_speed = vehicle.average_speed_kmh if vehicle.average_speed_kmh else default_speed
-        time_matrix = time_matrices.get(vehicle_idx, base_time_matrix)
-        
+        is_extra = vehicle.id in extra_vehicle_ids
+        tm = time_matrices.get(vehicle_idx, base_time_matrix)
+
         stops = []
-        route_boxes = 0.0
-        route_weight = 0.0
-        route_value = 0.0
-        route_distance = 0.0
-        route_wait_time = 0
-        route_service_time = 0
-        route_travel_time = 0
-        
+        route_boxes = route_weight = route_value = route_distance = 0.0
         current_time = request.start_time
         prev_node = 0
-        
-        print(f"\n=== ROTA {vehicle_idx + 1}: {vehicle.name} ({vehicle_speed} km/h) ===")
-        print(f"SaÃ­da do depot: {minutes_to_time(request.start_time)}")
-        
+
         for seq, node in enumerate(route_nodes):
             delivery = request.deliveries[node - 1]
             customer = customer_map.get(delivery.customer_id)
-            
-            all_assigned_deliveries.add(delivery.id)
-            
-            travel_time = time_matrix[prev_node][node]
+            all_assigned.add(delivery.id)
+
+            travel_time = tm[prev_node][node]
             distance = distance_matrix[prev_node][node]
-            
             arrival_time = current_time + travel_time
-            
-            window_start, window_end = time_windows[node]
-            
+            ws, we = time_windows[node]
+
             wait_time = 0
-            arrived_early = False
-            arrived_late = False
-            
-            if arrival_time < window_start:
-                wait_time = window_start - arrival_time
+            arrived_early = arrived_late = False
+            if arrival_time < ws:
+                wait_time = ws - arrival_time
                 arrived_early = True
-                service_start = window_start
+                service_start = ws
             else:
                 service_start = arrival_time
-                if arrival_time > window_end:
+                if arrival_time > we:
                     arrived_late = True
-            
-            service_time = service_times[node]
-            departure_time = service_start + service_time
-            
+
+            stop_service = service_times[node]
+            departure_time = service_start + stop_service
+
             route_boxes += delivery.boxes
             route_weight += delivery.weight_kg
             route_value += delivery.value
             route_distance += distance
-            route_wait_time += wait_time
-            route_service_time += service_time
-            route_travel_time += travel_time
-            
-            stop = RouteStop(
-                delivery_id=delivery.id,
-                customer_id=delivery.customer_id,
+
+            stops.append(RouteStop(
+                delivery_id=delivery.id, customer_id=delivery.customer_id,
                 customer_name=customer.name if customer else "?",
-                location=locations[node],
-                sequence=seq + 1,
-                arrival_time=arrival_time,
-                departure_time=departure_time,
-                service_time=service_time,
-                window_start=window_start,
-                window_end=window_end,
-                travel_time=travel_time,
-                distance_km=round(distance, 1),
-                wait_time=wait_time,
-                arrived_early=arrived_early,
-                arrived_late=arrived_late,
-                boxes=delivery.boxes,
-                weight_kg=delivery.weight_kg,
-                value=delivery.value
-            )
-            stops.append(stop)
-            
-            # Log resumido para evitar rate limit
-            status = ""
-            if arrived_early:
-                status = f" (espera {wait_time}min)"
-            elif arrived_late:
-                status = " âš ï¸ ATRASADO"
-            print(f"  {seq+1}. {customer.name if customer else '?'}: {minutes_to_time(arrival_time)}-{minutes_to_time(departure_time)}{status}")
-            
+                location=locations[node], sequence=seq + 1,
+                arrival_time=arrival_time, departure_time=departure_time,
+                service_time=stop_service, window_start=ws, window_end=we,
+                travel_time=travel_time, distance_km=round(distance, 1),
+                wait_time=wait_time, arrived_early=arrived_early, arrived_late=arrived_late,
+                boxes=delivery.boxes, weight_kg=delivery.weight_kg, value=delivery.value
+            ))
             current_time = departure_time
             prev_node = node
-        
-        total_time = current_time - request.start_time
-        
-        route = Route(
-            vehicle_id=vehicle.id,
-            vehicle_name=vehicle.name,
-            stops=stops,
-            total_boxes=round(route_boxes, 1),
-            total_weight=round(route_weight, 1),
-            total_value=round(route_value, 2),
-            total_distance_km=round(route_distance, 1),
-            total_time_minutes=total_time,
-            start_time=request.start_time,
-            end_time=current_time
-        )
-        routes.append(route)
+
+        routes.append(Route(
+            vehicle_id=vehicle.id, vehicle_name=vehicle.name, stops=stops,
+            total_boxes=round(route_boxes, 1), total_weight=round(route_weight, 1),
+            total_value=round(route_value, 2), total_distance_km=round(route_distance, 1),
+            total_time_minutes=current_time - request.start_time,
+            start_time=request.start_time, end_time=current_time,
+            is_extra_vehicle=is_extra
+        ))
         vehicles_used += 1
+        if is_extra:
+            extra_vehicles_used += 1
         total_value_all += route_value
-        
-        print(f"  RESUMO: {len(stops)} entregas, {round(route_boxes, 1)} caixas, {round(route_distance, 1)} km, {total_time} min")
-    
-    # Identificar entregas nÃ£o alocadas
+        tag = " 🚐 ADICIONAL" if is_extra else ""
+        print(f"  ROTA {vehicle.name}{tag}: {len(stops)} entregas, {round(route_boxes,1)} cx, {round(route_distance,1)} km")
+
     unassigned = []
     for delivery in request.deliveries:
-        if delivery.id not in all_assigned_deliveries:
+        if delivery.id not in all_assigned:
             unassigned.append(delivery.id)
             customer = customer_map.get(delivery.customer_id)
-            customer_name = customer.name if customer else "?"
-            print(f"âš ï¸ NÃƒO ALOCADA: {customer_name}")
-    
+            print(f"⚠️ NÃO ALOCADA: {customer.name if customer else '?'} (ID: {delivery.id})")
+
     optimization_time = int(time.time() * 1000 - start_time_ms)
-    
-    print(f"\n{'='*60}")
-    print(f"=== RESUMO FINAL ===")
-    print(f"{'='*60}")
-    print(f"VeÃ­culos usados: {vehicles_used}/{num_vehicles}")
-    print(f"Entregas alocadas: {len(all_assigned_deliveries)}/{len(request.deliveries)}")
-    print(f"Entregas pendentes: {len(unassigned)}")
-    print(f"Tempo de otimizaÃ§Ã£o: {optimization_time}ms")
-    
-    if len(unassigned) > 0:
-        print(f"\nâš ï¸ ATENÃ‡ÃƒO: {len(unassigned)} entregas NÃƒO foram alocadas!")
-        print(f"PossÃ­veis causas: capacidade insuficiente, janelas incompatÃ­veis, restriÃ§Ãµes de veÃ­culos")
-    
+
+    print(f"\n=== RESUMO FINAL ===")
+    print(f"Veículos: {vehicles_used} ({vehicles_used - extra_vehicles_used} reais + {extra_vehicles_used} adicionais)")
+    print(f"Alocadas: {len(all_assigned)}/{len(request.deliveries)} | Pendentes: {len(unassigned)} | {optimization_time}ms")
+
+    msg = f"Otimização concluída. {vehicles_used} veículos ({extra_vehicles_used} adicional(is)), {len(all_assigned)} entregas, {len(unassigned)} pendentes."
     return OptimizeResponse(
-        success=True,
-        message=f"OtimizaÃ§Ã£o concluÃ­da. {vehicles_used} veÃ­culos, {len(all_assigned_deliveries)} entregas alocadas, {len(unassigned)} pendentes.",
-        routes=routes,
-        unassigned_deliveries=unassigned,
-        vehicles_used=vehicles_used,
-        total_deliveries=len(request.deliveries),
-        total_value=round(total_value_all, 2),
-        optimization_time_ms=optimization_time
+        success=True, message=msg, routes=routes, unassigned_deliveries=unassigned,
+        vehicles_used=vehicles_used, total_deliveries=len(request.deliveries),
+        total_value=round(total_value_all, 2), optimization_time_ms=optimization_time,
+        extra_vehicles_used=extra_vehicles_used
     )
 
 
@@ -966,7 +816,6 @@ class RecalcRequest(BaseModel):
 
 
 class RecalcStopResult(BaseModel):
-    """Resultado por parada com ETAs recalculados"""
     delivery_id: str
     sequence: int
     arrival_time: int
@@ -979,7 +828,6 @@ class RecalcStopResult(BaseModel):
 
 
 class RecalcRouteResult(BaseModel):
-    """Resultado por rota"""
     route_id: str
     vehicle_id: str
     stops: List[RecalcStopResult]
@@ -997,53 +845,34 @@ class RecalcResponse(BaseModel):
 
 
 # ============== ENDPOINT RECALCULATE-ETAS ==============
+# PRESERVADO da versão estável: recalcula ETAs sequencialmente para rotas editadas
+# manualmente, SEM solver. Enviar APENAS as rotas que sofreram edição.
 
 @app.post("/recalculate-etas", response_model=RecalcResponse)
-async def recalculate_etas(request: RecalcRequest):
-    """
-    Recalcula ETAs sequencialmente para rotas editadas manualmente.
-    Sem solver/OR-Tools — apenas matemática sequencial (Haversine + tempo).
-    Enviar APENAS as rotas que sofreram edição.
-    """
+async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] = Header(None)):
+    check_api_key(authorization)
     start_ms = time.time() * 1000
 
     if not request.routes:
-        return RecalcResponse(
-            success=True,
-            message="Nenhuma rota para recalcular",
-            routes=[],
-            recalc_time_ms=0
-        )
+        return RecalcResponse(success=True, message="Nenhuma rota para recalcular", routes=[], recalc_time_ms=0)
 
-    print(f"\n{'='*60}")
-    print(f"=== RECALCULATE-ETAS ({len(request.routes)} rota(s)) ===")
-    print(f"{'='*60}")
-
+    print(f"\n=== RECALCULATE-ETAS ({len(request.routes)} rota(s)) ===")
     result_routes: List[RecalcRouteResult] = []
 
     for route in request.routes:
         speed = route.vehicle_speed_kmh or DEFAULT_SPEED_KMH
         current_time = route.start_time
-        prev_lat = route.depot_lat
-        prev_lng = route.depot_lng
-
+        prev_lat, prev_lng = route.depot_lat, route.depot_lng
         stop_results: List[RecalcStopResult] = []
         total_distance = 0.0
 
-        print(f"\nRota {route.route_id} | Velocidade: {speed} km/h | Saída: {minutes_to_time(route.start_time)}")
-
         for seq, stop in enumerate(route.stops):
-            # Distância Haversine do ponto anterior
             dist = haversine_distance(prev_lat, prev_lng, stop.lat, stop.lng)
             travel_time = int(math.ceil((dist / speed) * 60))
-
             arrival_time = current_time + travel_time
 
-            # Lógica de janela de tempo
             wait_time = 0
-            arrived_early = False
-            arrived_late = False
-
+            arrived_early = arrived_late = False
             if stop.window_start is not None and arrival_time < stop.window_start:
                 wait_time = stop.window_start - arrival_time
                 arrived_early = True
@@ -1057,51 +886,25 @@ async def recalculate_etas(request: RecalcRequest):
             total_distance += dist
 
             stop_results.append(RecalcStopResult(
-                delivery_id=stop.delivery_id,
-                sequence=seq + 1,
-                arrival_time=arrival_time,
-                departure_time=departure_time,
-                travel_time=travel_time,
-                wait_time=wait_time,
-                distance_km=round(dist, 1),
-                arrived_early=arrived_early,
-                arrived_late=arrived_late
+                delivery_id=stop.delivery_id, sequence=seq + 1,
+                arrival_time=arrival_time, departure_time=departure_time,
+                travel_time=travel_time, wait_time=wait_time,
+                distance_km=round(dist, 1), arrived_early=arrived_early, arrived_late=arrived_late
             ))
-
-            status = ""
-            if arrived_early:
-                status = f" (espera {wait_time}min)"
-            elif arrived_late:
-                status = " ⚠️ ATRASADO"
-            print(f"  {seq+1}. {stop.customer_name or stop.delivery_id}: {minutes_to_time(arrival_time)}-{minutes_to_time(departure_time)}{status}")
-
             current_time = departure_time
-            prev_lat = stop.lat
-            prev_lng = stop.lng
-
-        total_time = current_time - route.start_time
+            prev_lat, prev_lng = stop.lat, stop.lng
 
         result_routes.append(RecalcRouteResult(
-            route_id=route.route_id,
-            vehicle_id=route.vehicle_id,
-            stops=stop_results,
+            route_id=route.route_id, vehicle_id=route.vehicle_id, stops=stop_results,
             total_distance_km=round(total_distance, 1),
-            total_time_minutes=total_time,
-            start_time=route.start_time,
-            end_time=current_time
+            total_time_minutes=current_time - route.start_time,
+            start_time=route.start_time, end_time=current_time
         ))
 
-        print(f"  RESUMO: {len(stop_results)} paradas, {round(total_distance, 1)} km, {total_time} min")
-
     recalc_time = int(time.time() * 1000 - start_ms)
-
-    print(f"\nRecálculo concluído em {recalc_time}ms")
-
     return RecalcResponse(
-        success=True,
-        message=f"{len(result_routes)} rota(s) recalculada(s)",
-        routes=result_routes,
-        recalc_time_ms=recalc_time
+        success=True, message=f"{len(result_routes)} rota(s) recalculada(s)",
+        routes=result_routes, recalc_time_ms=recalc_time
     )
 
 
@@ -1109,13 +912,12 @@ async def recalculate_etas(request: RecalcRequest):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "7.8.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.0"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "7.8.0"}
-
+    return {"status": "healthy", "version": "11.0"}
 
 
 # ============== MAIN ==============
