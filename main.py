@@ -44,16 +44,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Autenticação opcional: só é exigida se a variável de ambiente existir.
-# Mantém compatibilidade com o fluxo atual (API aberta) enquanto não for configurada.
+# Autenticação opcional: SÓ é exigida quando ligada explicitamente via
+# ORTOOLS_REQUIRE_AUTH=true. A mera presença de ORTOOLS_API_KEY (que já existe
+# no Railway por legado) NÃO ativa a checagem — senão quebra o roteirizador,
+# que hoje chama a API sem enviar token. Ativar só depois que o roteirizador
+# passar a mandar o header Authorization.
 ORTOOLS_API_KEY = os.getenv("ORTOOLS_API_KEY")
+ORTOOLS_REQUIRE_AUTH = os.getenv("ORTOOLS_REQUIRE_AUTH", "false").lower() == "true"
 
 
 def check_api_key(authorization: Optional[str]):
-    if not ORTOOLS_API_KEY:
-        return  # API aberta (comportamento atual)
-    expected = f"Bearer {ORTOOLS_API_KEY}"
-    if authorization != expected:
+    if not (ORTOOLS_REQUIRE_AUTH and ORTOOLS_API_KEY):
+        return  # API aberta (comportamento atual / padrão)
+    if authorization != f"Bearer {ORTOOLS_API_KEY}":
         raise HTTPException(status_code=401, detail="Token inválido")
 
 
