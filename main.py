@@ -792,8 +792,8 @@ class RecalcStop(BaseModel):
     """Parada na ordem definida pelo usuário"""
     delivery_id: str
     customer_name: Optional[str] = None
-    lat: float
-    lng: float
+    lat: Optional[float] = None      # tolerante: cliente sem coordenada não derruba o lote
+    lng: Optional[float] = None
     service_time: int = DEFAULT_SERVICE_TIME
     window_start: Optional[int] = None
     window_end: Optional[int] = None
@@ -805,7 +805,7 @@ class RecalcStop(BaseModel):
 class RecalcRoute(BaseModel):
     """Rota editada para recálculo de ETAs"""
     route_id: str
-    vehicle_id: str
+    vehicle_id: Optional[str] = None   # tolerante: rota "sem veículo" / carro adicional não derruba o lote
     vehicle_speed_kmh: Optional[float] = None
     start_time: int = 360
     depot_lat: float
@@ -832,7 +832,7 @@ class RecalcStopResult(BaseModel):
 
 class RecalcRouteResult(BaseModel):
     route_id: str
-    vehicle_id: str
+    vehicle_id: Optional[str] = None
     stops: List[RecalcStopResult]
     total_distance_km: float
     total_time_minutes: int
@@ -870,7 +870,12 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
         total_distance = 0.0
 
         for seq, stop in enumerate(route.stops):
-            dist = haversine_distance(prev_lat, prev_lng, stop.lat, stop.lng)
+            # Parada (ou ponto anterior) sem coordenada: não dá pra medir deslocamento —
+            # assume 0 e mantém a última posição conhecida, sem derrubar o lote inteiro.
+            if stop.lat is None or stop.lng is None or prev_lat is None or prev_lng is None:
+                dist = 0.0
+            else:
+                dist = haversine_distance(prev_lat, prev_lng, stop.lat, stop.lng)
             travel_time = int(math.ceil((dist / speed) * 60))
             arrival_time = current_time + travel_time
 
@@ -895,7 +900,8 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
                 distance_km=round(dist, 1), arrived_early=arrived_early, arrived_late=arrived_late
             ))
             current_time = departure_time
-            prev_lat, prev_lng = stop.lat, stop.lng
+            if stop.lat is not None and stop.lng is not None:
+                prev_lat, prev_lng = stop.lat, stop.lng
 
         result_routes.append(RecalcRouteResult(
             route_id=route.route_id, vehicle_id=route.vehicle_id, stops=stop_results,
