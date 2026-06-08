@@ -29,6 +29,8 @@ from ortools.constraint_solver import pywrapcp
 import os
 import math
 import time
+import json
+import urllib.request
 
 app = FastAPI(
     title="OR-Tools Route Optimizer",
@@ -74,6 +76,13 @@ COST_AGREGADO_GRANDE = 10_000
 # Carro adicional/reserva: bem mais caro que qualquer real, mas MUITO mais barato que
 # deixar cliente de fora -> o solver só adiciona um carro quando realmente precisa.
 COST_EXTRA_VEHICLE = 1_000_000
+
+# OSRM (tempos reais de carro pela rua). INERTE até OSRM_URL ser definida no ambiente.
+# Quando setada, o otimizador pede a matriz real ao OSRM (sem limite de 25 paradas)
+# e aplica um fator de trânsito por cima do tempo de fluxo livre.
+OSRM_URL = os.getenv("OSRM_URL", "").strip()
+OSRM_TRAFFIC_FACTOR = float(os.getenv("OSRM_TRAFFIC_FACTOR", "1.3"))
+OSRM_TIMEOUT = float(os.getenv("OSRM_TIMEOUT", "25"))
 
 
 # ============== MODELOS DE DADOS ==============
@@ -264,6 +273,36 @@ def scale_matrix(base: List[List[int]], factor: float) -> List[List[int]]:
         return [row[:] for row in base]
     n = len(base)
     return [[int(math.ceil(base[i][j] * factor)) for j in range(n)] for i in range(n)]
+
+
+def fetch_osrm_matrix(locations: List[Location]) -> Optional[List[List[int]]]:
+    """
+    Busca a matriz de tempos REAL (carro pela rua) no OSRM, em minutos, já com o
+    fator de trânsito aplicado. Retorna None se OSRM_URL não estiver setada ou falhar
+    (aí o fluxo cai no fallback — matriz do roteirizador ou Haversine). INERTE por padrão.
+    """
+    if not OSRM_URL:
+        return None
+    try:
+        coords = ";".join(f"{loc.lng},{loc.lat}" for loc in locations)  # OSRM usa lng,lat
+        url = f"{OSRM_URL.rstrip('/')}/table/v1/driving/{coords}?annotations=duration"
+        with urllib.request.urlopen(url, timeout=OSRM_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("code") != "Ok" or "durations" not in data:
+            print(f"  OSRM resposta inesperada: {data.get('code')}")
+            return None
+        dur = data["durations"]
+        n = len(locations)
+        if len(dur) != n:
+            return None
+        # segundos -> minutos, com fator de trânsito; None (sem rota) vira 0
+        return [
+            [int(math.ceil(((dur[i][j] or 0) / 60.0) * OSRM_TRAFFIC_FACTOR)) for j in range(n)]
+            for i in range(n)
+        ]
+    except Exception as e:
+        print(f"  OSRM indisponível ({e}) — usando fallback")
+        return None
 
 
 def build_time_matrices(
@@ -534,10 +573,19 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
         vehicle_costs.append(COST_EXTRA_VEHICLE if v.id in extra_vehicle_ids else classify_vehicle_cost(v))
 
     # ===== MATRIZES =====
+    # Prioridade: OSRM (rua real, sem limite de 25) > matriz do roteirizador > Haversine.
+    osrm_matrix = fetch_osrm_matrix(locations)
+    base_provided = osrm_matrix if osrm_matrix else request.time_matrix
+    if osrm_matrix:
+        matrix_source = f"OSRM real (fator trânsito {OSRM_TRAFFIC_FACTOR})"
+    elif request.time_matrix:
+        matrix_source = "roteirizador (payload)"
+    else:
+        matrix_source = "Haversine (fallback)"
     time_matrices, base_time_matrix, used_real = build_time_matrices(
-        locations, vehicles, request.time_matrix, default_speed
+        locations, vehicles, base_provided, default_speed
     )
-    print(f"Matriz de tempo: {'REAL (roteirizador)' if used_real else 'Haversine (fallback)'}")
+    print(f"Matriz de tempo: {matrix_source}")
     distance_matrix = create_distance_matrix(locations)
 
     delivery_id_to_node = {d.id: i + 1 for i, d in enumerate(request.deliveries)}
