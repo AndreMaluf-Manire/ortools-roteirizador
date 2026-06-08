@@ -75,6 +75,25 @@ COST_AGREGADO_GRANDE = 10_000
 # deixar cliente de fora -> o solver só adiciona um carro quando realmente precisa.
 COST_EXTRA_VEHICLE = 1_000_000
 
+# Horário de saída por veículo (minutos). Prioridade: vehicle.start_time (cadastro) >
+# este mapa temporário (por nome) > start_time global do request (6h).
+# TEMPORÁRIO: até o roteirizador mandar start_time por veículo a partir do cadastro.
+DEPARTURE_OVERRIDES = [
+    ("IVECO", 240),   # Valmir — 04:00
+    ("DUCATO", 180),  # Daniel — 03:00
+    ("3/4", 180),     # Caminhão 3/4 (EDU) — 03:00
+]
+
+
+def vehicle_departure(vehicle, default_start: int) -> int:
+    if vehicle.start_time is not None:
+        return vehicle.start_time
+    name = (vehicle.name or "").strip().upper()
+    for key, minutes in DEPARTURE_OVERRIDES:
+        if key in name:
+            return minutes
+    return default_start
+
 
 # ============== MODELOS DE DADOS ==============
 
@@ -119,6 +138,8 @@ class Vehicle(BaseModel):
     # Opcional: classificação explícita de custo vinda do cadastro.
     # Valores: "propria" | "agregado_pequeno" | "agregado_grande".
     cost_tier: Optional[str] = None
+    # Horário de saída do depot em minutos (ex.: 240 = 04:00). Se None, usa o global.
+    start_time: Optional[int] = None
 
 
 class RoutingRuleCondition(BaseModel):
@@ -595,10 +616,15 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
         else:
             time_dimension.CumulVar(index).SetRange(ws, we)
 
+    # Horário de saída por veículo (Valmir 04h, Daniel/EDU 03h, demais 06h — via mapa/cadastro)
+    vehicle_starts = [vehicle_departure(v, request.start_time) for v in vehicles]
     for vehicle_idx in range(num_vehicles):
         time_dimension.SetSpanCostCoefficientForVehicle(100, vehicle_idx)
         start_index = routing.Start(vehicle_idx)
-        time_dimension.CumulVar(start_index).SetRange(request.start_time, request.start_time)
+        st = vehicle_starts[vehicle_idx]
+        time_dimension.CumulVar(start_index).SetRange(st, st)
+        if st != request.start_time:
+            print(f"  Saída especial: {vehicles[vehicle_idx].name} -> {minutes_to_time(st)}")
 
     # Capacidade (caixas por cliente)
     def demand_callback(from_index):
@@ -704,7 +730,8 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
 
         stops = []
         route_boxes = route_weight = route_value = route_distance = 0.0
-        current_time = request.start_time
+        veh_start = vehicle_starts[vehicle_idx]
+        current_time = veh_start
         prev_node = 0
 
         for seq, node in enumerate(route_nodes):
@@ -753,8 +780,8 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
             vehicle_id=vehicle.id, vehicle_name=vehicle.name, stops=stops,
             total_boxes=round(route_boxes, 1), total_weight=round(route_weight, 1),
             total_value=round(route_value, 2), total_distance_km=round(route_distance, 1),
-            total_time_minutes=current_time - request.start_time,
-            start_time=request.start_time, end_time=current_time,
+            total_time_minutes=current_time - veh_start,
+            start_time=veh_start, end_time=current_time,
             is_extra_vehicle=is_extra
         ))
         vehicles_used += 1
