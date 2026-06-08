@@ -330,6 +330,7 @@ def build_time_matrices(
     vehicles: List["Vehicle"],
     provided_matrix: Optional[List[List[int]]],
     default_speed: float,
+    apply_vehicle_speed: bool = True,
 ) -> (Dict[int, List[List[int]]], List[List[int]], bool):
     """
     Retorna (matrizes_por_veiculo, matriz_base, usou_matriz_real).
@@ -350,7 +351,10 @@ def build_time_matrices(
     matrices: Dict[int, List[List[int]]] = {}
     for idx, vehicle in enumerate(vehicles):
         speed = vehicle.average_speed_kmh if vehicle.average_speed_kmh else default_speed
-        if used_real:
+        if used_real and not apply_vehicle_speed:
+            # OSRM já dá o tempo real de carro -> usa igual pra todos (sem multiplicador de velocidade).
+            matrices[idx] = [row[:] for row in base_matrix]
+        elif used_real:
             # Matriz real é "carro normal" ~ default_speed. Veículo mais rápido -> tempos menores.
             factor = default_speed / speed if speed else 1.0
             matrices[idx] = scale_matrix(base_matrix, factor)
@@ -603,7 +607,8 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
     else:
         matrix_source = "Haversine (fallback)"
     time_matrices, base_time_matrix, used_real = build_time_matrices(
-        locations, vehicles, base_provided, default_speed
+        locations, vehicles, base_provided, default_speed,
+        apply_vehicle_speed=(osrm_matrix is None),  # sob OSRM, ignora velocidade por veículo
     )
     print(f"Matriz de tempo: {matrix_source}")
     distance_matrix = create_distance_matrix(locations)
