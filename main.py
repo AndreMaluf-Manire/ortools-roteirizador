@@ -297,16 +297,18 @@ def scale_matrix(base: List[List[int]], factor: float) -> List[List[int]]:
     return [[int(math.ceil(base[i][j] * factor)) for j in range(n)] for i in range(n)]
 
 
-def fetch_osrm_matrix(locations: List[Location]) -> Optional[List[List[int]]]:
+def fetch_osrm_matrix(locations: List[Location]):
     """
-    Matriz de tempos REAL (carro pela rua) via OSRM, em minutos, já com fator de trânsito.
+    Via OSRM, retorna (tempos_min, distancias_km) REAIS de carro pela rua:
+      - tempos em minutos, já com fator de trânsito;
+      - distâncias em km (estrada real), sem fator (distância não muda com trânsito).
     Retorna None se OSRM_URL não estiver setada ou falhar (cai no fallback). INERTE por padrão.
     """
     if not OSRM_URL:
         return None
     try:
         coords = ";".join(f"{loc.lng},{loc.lat}" for loc in locations)  # OSRM usa lng,lat
-        url = f"{OSRM_URL.rstrip('/')}/table/v1/driving/{coords}?annotations=duration"
+        url = f"{OSRM_URL.rstrip('/')}/table/v1/driving/{coords}?annotations=duration,distance"
         with urllib.request.urlopen(url, timeout=OSRM_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         if data.get("code") != "Ok" or "durations" not in data:
@@ -316,10 +318,15 @@ def fetch_osrm_matrix(locations: List[Location]) -> Optional[List[List[int]]]:
         n = len(locations)
         if len(dur) != n:
             return None
-        return [
+        time_min = [
             [int(math.ceil(((dur[i][j] or 0) / 60.0) * OSRM_TRAFFIC_FACTOR)) for j in range(n)]
             for i in range(n)
         ]
+        dist_raw = data.get("distances")
+        dist_km = None
+        if dist_raw and len(dist_raw) == n:
+            dist_km = [[round((dist_raw[i][j] or 0) / 1000.0, 2) for j in range(n)] for i in range(n)]
+        return (time_min, dist_km)
     except Exception as e:
         print(f"  OSRM indisponível ({e}) — usando fallback")
         return None
@@ -598,9 +605,11 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
 
     # ===== MATRIZES =====
     # Prioridade: OSRM (rua real, sem limite de 25) > matriz do roteirizador > Haversine.
-    osrm_matrix = fetch_osrm_matrix(locations)
-    base_provided = osrm_matrix if osrm_matrix else request.time_matrix
-    if osrm_matrix:
+    osrm = fetch_osrm_matrix(locations)
+    osrm_time = osrm[0] if osrm else None
+    osrm_dist = osrm[1] if osrm else None
+    base_provided = osrm_time if osrm_time else request.time_matrix
+    if osrm_time:
         matrix_source = f"OSRM real (fator trânsito {OSRM_TRAFFIC_FACTOR})"
     elif request.time_matrix:
         matrix_source = "roteirizador (payload)"
@@ -608,10 +617,11 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
         matrix_source = "Haversine (fallback)"
     time_matrices, base_time_matrix, used_real = build_time_matrices(
         locations, vehicles, base_provided, default_speed,
-        apply_vehicle_speed=(osrm_matrix is None),  # sob OSRM, ignora velocidade por veículo
+        apply_vehicle_speed=(osrm_time is None),  # sob OSRM, ignora velocidade por veículo
     )
     print(f"Matriz de tempo: {matrix_source}")
-    distance_matrix = create_distance_matrix(locations)
+    # Distância reportada: estrada real do OSRM quando disponível; senão Haversine.
+    distance_matrix = osrm_dist if osrm_dist else create_distance_matrix(locations)
 
     delivery_id_to_node = {d.id: i + 1 for i, d in enumerate(request.deliveries)}
     vehicle_id_to_idx = {v.id: i for i, v in enumerate(vehicles)}
