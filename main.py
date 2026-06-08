@@ -75,8 +75,11 @@ COST_AGREGADO_GRANDE = 10_000
 # deixar cliente de fora -> o solver só adiciona um carro quando realmente precisa.
 COST_EXTRA_VEHICLE = 1_000_000
 
+# Padrão de saída do depot (minutos) para veículos SEM horário definido. 300 = 05:00.
+GLOBAL_DEFAULT_DEPARTURE = 300
+
 # Horário de saída por veículo (minutos). Prioridade: vehicle.start_time (cadastro) >
-# este mapa temporário (por nome) > start_time global do request (6h).
+# este mapa temporário (por nome) > padrão global (GLOBAL_DEFAULT_DEPARTURE = 05:00).
 # TEMPORÁRIO: até o roteirizador mandar start_time por veículo a partir do cadastro.
 DEPARTURE_OVERRIDES = [
     ("IVECO", 240),   # Valmir — 04:00
@@ -617,7 +620,7 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
             time_dimension.CumulVar(index).SetRange(ws, we)
 
     # Horário de saída por veículo (Valmir 04h, Daniel/EDU 03h, demais 06h — via mapa/cadastro)
-    vehicle_starts = [vehicle_departure(v, request.start_time) for v in vehicles]
+    vehicle_starts = [vehicle_departure(v, GLOBAL_DEFAULT_DEPARTURE) for v in vehicles]
     for vehicle_idx in range(num_vehicles):
         time_dimension.SetSpanCostCoefficientForVehicle(100, vehicle_idx)
         start_index = routing.Start(vehicle_idx)
