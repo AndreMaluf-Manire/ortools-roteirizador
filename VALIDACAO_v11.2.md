@@ -134,11 +134,15 @@ idêntico). Não foi suposição.
   1-comando, documentado no README do front ("Deploy do front"): pedir numa sessão
   Claude Code → `deploy_project` + verificação de `latest_commit_sha`. Rollback do
   front também documentado lá (revert na main → sync → republish).
-- **Gate de build criado** (`tsc --noEmit` + testes + `vite build` em todo push/PR
-  na main): arquivo pronto em `.github/workflows-pendente/ci.yml` no repo do front.
-  ⏳ **1 passo do André pra ativar:** mover pra `.github/workflows/ci.yml` (o PAT
-  desta máquina não tem scope `workflow` — GitHub recusa criação de workflow por
-  token sem esse scope). Regra operacional: **CI vermelho na main = não publicar.**
+- **Gate de build ATIVO (2026-07-07):** `.github/workflows/ci.yml` no repo do front
+  (`npm ci` + `tsc --noEmit` + testes + `vite build` em todo push/PR na main).
+  André adicionou o scope `workflow` ao PAT "Claude Code iMac" (checkbox na UI do
+  GitHub — o valor do token não mudou). A 1ª run pegou um problema REAL:
+  `package-lock.json` fora de sync com `package.json` (deps de teste do Lovable) —
+  corrigido em `aa69007`; run VERDE:
+  https://github.com/Grupo-Manire/roteirizadorfruleve/actions/runs/28838387007
+  Diretório `workflows-pendente/` removido. Regra operacional:
+  **CI vermelho na main = não publicar.**
 
 **Smoke pós-publish (caminho real do front):**
 - Edge `recalculate-etas` de produção: viva e **barrando corretamente** requisição
