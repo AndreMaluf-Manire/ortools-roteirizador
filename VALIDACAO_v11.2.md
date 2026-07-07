@@ -86,13 +86,32 @@ deploy e conferir `matrix_source: "osrm"` no log do Railway.
   redeploya v11.1. Alternativa cirúrgica sem deploy: **remover a env `OSRM_URL`**
   desliga a régua OSRM em TUDO (optimize + recalc) — só usar se quiser matar OSRM geral.
 
-## Candidatos pra RODADA 2 (registrados, NÃO mexer agora)
+## RODADA 2 — EXECUTADA (2026-07-06, aprovação do André)
 
-1. **Régua 3 — RouteEditor/Google:** a página `RouteEditor.tsx` (editor de rota
-   individual, repo `roteirizadorfruleve`) recalcula ETA via edge `distance-matrix`
-   (Google Distance Matrix, chave da empresa), **não pelo motor**. Após a v11.2
-   ainda existem 2 réguas no produto (OSRM vs Google). Unificar = apontar o botão do
-   RouteEditor pra edge `recalculate-etas`. Decisão do André.
-2. **Código morto:** `recalculateRouteETAs(routeId)` em `src/pages/Routes.tsx:1246`
-   (repo `roteirizadorfruleve`) — definida, chama a edge do motor, **nenhum chamador
-   encontrado**. Marcar pra remoção na próxima faxina do front. NÃO removida agora.
+PR só de frontend (repo `roteirizadorfruleve`, branch `feat/routeeditor-regua-unica-osrm`).
+**Zero toques no motor/Railway.**
+
+1. ✅ **Régua 3 eliminada:** o botão "Atualizar ETA" do `RouteEditor.tsx` agora chama
+   a edge `recalculate-etas` (a MESMA do board) em vez da `distance-matrix`/Google.
+   Payload espelha o do `handleSaveChanges` do board. Junto:
+   - Campo "Saída" do editor passa a inicializar do `routes.start_time` real do banco
+     (antes assumia 06:00 fixo — os ETAs divergiam do board por construção);
+   - Removido o limite de 20 paradas (era restrição dos 25 elementos da API Google;
+     o motor não tem esse limite — board nunca teve);
+   - Removidos `applyDurations` (cálculo local de ETA no front) e o cache de durações.
+   - Badge adiantado/atrasado preservado (mapeado de `arrived_early`/`arrived_late`).
+2. ✅ **Código morto removido:** `recalculateRouteETAs(routeId)` em
+   `src/pages/Routes.tsx` (84 linhas, zero chamadores).
+3. **Consumidores da edge `distance-matrix` verificados antes de remover a chamada:**
+   grep no repo inteiro — o RouteEditor era o ÚNICO consumidor. A edge em si ficou
+   no ar (sem chamadores); apagar a function é faxina futura opcional.
+
+**Validação rodada 2:**
+- `tsc --noEmit` limpo, `vite build` OK, testes do repo passam.
+- Equivalência board × RouteEditor contra o MOTOR DE PRODUÇÃO: payload construído
+  exatamente como cada tela constrói (mesma rota de 3 paradas, janela com espera de
+  137min) → **respostas idênticas em todas as paradas** (chegada, viagem, espera,
+  km), ambos `matrix_source: "osrm"`.
+- ⏳ **Pendente pós-publish (Lovable, André):** abrir uma rota no RouteEditor,
+  clicar "Atualizar ETA" e conferir que os horários batem com os do board para a
+  mesma sequência. Front não tem auto-deploy do Git — precisa do publish.
