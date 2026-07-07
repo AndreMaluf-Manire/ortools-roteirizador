@@ -2,6 +2,18 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
+VERSÃO 11.1 - CONSOLIDAÇÃO DE VEÍCULOS (menos carro, mesmas entregas):
+- Custo fixo de veículo real subiu de 500-10k para 100k-150k: abrir carro novo
+  agora só compensa quando o atual NÃO comporta (capacidade/janelas). Cada
+  veículo-dia é dinheiro real de freteiro.
+- Span 300/min (era 100), calibrado JUNTO com o custo fixo: consolidar entrega
+  em rota existente (~6k-12k) é sempre mais barato que abrir carro (100k+).
+- Órfã continua blindada: penalidade 100 trilhões = 1e9 vezes um carro real.
+- Fixed Driver virou preferência SUAVE (custo de arco, 25k) — não gera órfã e
+  não fura mais a exclusividade dos veículos Vivenda.
+- Campo "mode" do payload removido (era aceito e ignorado); extras não quebram.
+- Tempo de solução 150s (era 60), com folga sob o timeout de 300s do Railway.
+
 VERSÃO 11.0 - PRECISÃO + ENCAIXA TODOS:
 - Lê a time_matrix REAL enviada pelo roteirizador (Google Distance Matrix),
   com fallback Haversine por veículo quando não vier.
@@ -15,7 +27,7 @@ VERSÃO 11.0 - PRECISÃO + ENCAIXA TODOS:
   só quando a frota real não fecha. DESLIGADO por padrão (config.allow_extra_vehicles).
 - Hierarquia de custos por tipo de veículo (própria < agregado pequeno < grande).
 - Vivenda configurável + exclusividade bidirecional (sem UUID hardcoded).
-- Fixed Driver rígido sem ser sobrescrito pela regra Vivenda.
+- Fixed Driver rígido sem ser sobrescrito pela regra Vivenda. (11.1: virou suave)
 - /recalculate-etas PRESERVADO (recálculo só do que foi editado, sem solver).
 - Autenticação opcional por segredo compartilhado (só ativa se ORTOOLS_API_KEY existir).
 """
@@ -35,7 +47,7 @@ import urllib.request
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="11.0"
+    version="11.1"
 )
 
 app.add_middleware(
@@ -67,15 +79,36 @@ DEFAULT_SPEED_KMH = 16.0          # velocidade de referência (base do multiplic
 MAX_TIME_HORIZON = 1440           # 24h em minutos
 DEFAULT_SERVICE_TIME = 15
 PENALTY_UNASSIGNED = 100_000_000_000_000   # 100 trilhões (último recurso: nunca deixar de fora)
-SOLUTION_TIME_LIMIT = 60
+# 150s de GLS: mais consolidação nos dias pesados, com folga contra o timeout de
+# request de 300s do Railway (serialização da resposta + rede ficam fora do limite).
+SOLUTION_TIME_LIMIT = 150
 
-# Custos fixos por tipo de veículo (quanto menor, mais "barato"/preferido)
-COST_FROTA_PROPRIA = 500
-COST_AGREGADO_PEQUENO = 5_000
-COST_AGREGADO_GRANDE = 10_000
+# Custos fixos por tipo de veículo (quanto menor, mais "barato"/preferido).
+# CALIBRAÇÃO (v11.1) — hierarquia de magnitudes que garante o comportamento:
+#   órfão (1e14)  >>  carro extra (1e6)  >>  carro real (1e5)  >>  span de rota (3e2/min)
+# - Abrir carro real custa ~100k; esticar rota custa SPAN_COST_PER_MIN=300/min.
+#   Break-even: só compensa abrir carro novo se consolidar esticasse a rota em
+#   mais de ~333min (100k/300) — na prática, capacidade e janelas mandam.
+# - Órfão (1e14) é 1e9 vezes um carro real: o solver jamais sacrifica entrega
+#   para economizar veículo. Alocação 100% permanece blindada por construção.
+# - Gaps absolutos entre tiers (20k/30k) mantêm a preferência própria < agregado.
+COST_FROTA_PROPRIA = 100_000
+COST_AGREGADO_PEQUENO = 120_000
+COST_AGREGADO_GRANDE = 150_000
 # Carro adicional/reserva: bem mais caro que qualquer real, mas MUITO mais barato que
 # deixar cliente de fora -> o solver só adiciona um carro quando realmente precisa.
 COST_EXTRA_VEHICLE = 1_000_000
+
+# Custo por minuto de duração de rota (span). Mantém pressão contra rotas
+# absurdamente longas SEM inverter o incentivo: encaixar uma entrega a mais numa
+# rota existente (~20-40min = 6k-12k) é sempre mais barato que abrir carro (100k+).
+SPAN_COST_PER_MIN = 300
+
+# Preferência SUAVE de motorista (fixed_driver): desconto/penalidade no custo de
+# arco quando a entrega cai fora do veículo do freteiro. Menor que o custo de um
+# carro real (não força abrir carro só pela preferência) e maior que um desvio
+# típico de rota (~5k-10k) — a preferência vence quando o carro já está em uso.
+PREFERRED_DRIVER_PENALTY = 25_000
 
 # OSRM (tempos reais de carro pela rua). INERTE até OSRM_URL ser definida no ambiente.
 OSRM_URL = os.getenv("OSRM_URL", "").strip()
@@ -197,7 +230,9 @@ class OptimizeRequest(BaseModel):
     deliveries: List[Delivery]
     vehicles: List[Vehicle]
     start_time: int = 360
-    mode: str = "minimize_vehicles"
+    # (v11.1) campo "mode" REMOVIDO: era aceito e ignorado. Minimizar veículos é o
+    # comportamento nativo do modelo (custos fixos altos). Payloads antigos que
+    # ainda enviam "mode" seguem funcionando — Pydantic ignora campos extras.
     delivery_groups: Optional[List[List[str]]] = None
     routing_rules: Optional[List[RoutingRule]] = None
     config: Optional[OptimizationConfig] = None
@@ -459,7 +494,7 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
     print(f"=== OTIMIZAÇÃO v11.0 - PRECISÃO + ENCAIXA TODOS ===")
     print(f"{'='*60}")
     print(f"Depot: {request.depot.name} | Entregas: {len(request.deliveries)} | Veículos: {len(request.vehicles)}")
-    print(f"Modo: {request.mode} | Penalidade não-atendimento: {PENALTY_UNASSIGNED:,}")
+    print(f"Penalidade não-atendimento: {PENALTY_UNASSIGNED:,} | Custo carro real: {COST_FROTA_PROPRIA:,}+")
 
     if len(request.deliveries) == 0:
         return OptimizeResponse(
@@ -553,7 +588,7 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
                         group.append(delivery.id)
                 if len(group) > 1:
                     request.delivery_groups = (request.delivery_groups or []) + [group]
-        print(f"  Fixed Driver: {len(fixed_assignments)} entrega(s) travada(s)")
+        print(f"  Fixed Driver: {len(fixed_assignments)} entrega(s) com preferência suave de veículo")
 
     # ===== JANELAS DE TEMPO =====
     time_windows = [(0, MAX_TIME_HORIZON)]
@@ -626,6 +661,14 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
     delivery_id_to_node = {d.id: i + 1 for i, d in enumerate(request.deliveries)}
     vehicle_id_to_idx = {v.id: i for i, v in enumerate(vehicles)}
 
+    # (v11.1) Fixed Driver SUAVE: nó -> índice do veículo preferido. A preferência
+    # entra como penalidade no custo de arco do veículo "errado" (abaixo), nunca
+    # como trava rígida — trava rígida + janela infeasível gerava risco de órfã.
+    node_preferred_vehicle: Dict[int, int] = {}
+    for delivery_id, vehicle_id in fixed_assignments.items():
+        if delivery_id in delivery_id_to_node and vehicle_id in vehicle_id_to_idx:
+            node_preferred_vehicle[delivery_id_to_node[delivery_id]] = vehicle_id_to_idx[vehicle_id]
+
     # ===== DEMANDA (CAIXAS POR CLIENTE) =====
     # 0,5 + 0,5 do MESMO cliente = 1; de clientes diferentes = 1 cada.
     customer_total_boxes: Dict[str, float] = {}
@@ -650,7 +693,12 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
         def cb(from_index, to_index):
             fn = manager.IndexToNode(from_index)
             tn = manager.IndexToNode(to_index)
-            return tm[fn][tn] + (service_times[tn] if tn > 0 else 0)
+            cost = tm[fn][tn] + (service_times[tn] if tn > 0 else 0)
+            # Preferência suave de motorista: só encarece o CUSTO DE ARCO deste
+            # veículo (a dimensão Time usa outro callback — ETAs não mudam).
+            if tn in node_preferred_vehicle and node_preferred_vehicle[tn] != vehicle_idx:
+                cost += PREFERRED_DRIVER_PENALTY
+            return cost
         return cb
 
     time_callback_indices = []
@@ -681,7 +729,7 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
     # Horário de saída por veículo (Valmir 04h, Daniel/EDU 03h, demais 06h — via mapa/cadastro)
     vehicle_starts = [vehicle_departure(v, GLOBAL_DEFAULT_DEPARTURE) for v in vehicles]
     for vehicle_idx in range(num_vehicles):
-        time_dimension.SetSpanCostCoefficientForVehicle(100, vehicle_idx)
+        time_dimension.SetSpanCostCoefficientForVehicle(SPAN_COST_PER_MIN, vehicle_idx)
         start_index = routing.Start(vehicle_idx)
         st = vehicle_starts[vehicle_idx]
         time_dimension.CumulVar(start_index).SetRange(st, st)
@@ -716,23 +764,22 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
             if delivery.vehicle_id and delivery.vehicle_id in vehicle_id_to_idx:
                 index = manager.NodeToIndex(delivery_id_to_node[delivery.id])
                 routing.SetAllowedVehiclesForIndex([vehicle_id_to_idx[delivery.vehicle_id]], index)
-        # Não-Vivenda: proibir nos veículos exclusivos — exceto fixed drivers (não sobrescrever).
+        # Não-Vivenda: proibir nos veículos exclusivos — vale para TODAS, inclusive
+        # fixed driver (v11.1: a preferência agora é suave, então a exclusividade
+        # inversa dos FIORINOs volta a cobrir 100% das entregas não-Vivenda).
         non_vivenda_idx = [i for i in range(num_vehicles) if i not in vivenda_idx]
         if non_vivenda_idx:
             for delivery in non_vivenda_deliveries:
-                if delivery.id in fixed_assignments:
-                    continue
                 index = manager.NodeToIndex(delivery_id_to_node[delivery.id])
                 routing.SetAllowedVehiclesForIndex(non_vivenda_idx, index)
         else:
             print("  ⚠️ TODOS os veículos são Vivenda — não-Vivenda podem ficar órfãs")
 
-    # ===== FIXED DRIVER (rígido) — aplicado por último para não ser sobrescrito =====
-    if fixed_assignments:
-        for delivery_id, vehicle_id in fixed_assignments.items():
-            if delivery_id in delivery_id_to_node and vehicle_id in vehicle_id_to_idx:
-                index = manager.NodeToIndex(delivery_id_to_node[delivery_id])
-                routing.SetAllowedVehiclesForIndex([vehicle_id_to_idx[vehicle_id]], index)
+    # (v11.1) FIXED DRIVER: trava rígida (SetAllowedVehiclesForIndex) REMOVIDA.
+    # A preferência é aplicada como custo suave no arco (make_time_callback):
+    # cair fora do veículo do freteiro custa PREFERRED_DRIVER_PENALTY — caro o
+    # bastante pra ser respeitada quando o carro roda, barato o bastante pra
+    # nunca abrir carro extra nem gerar órfã só por causa da preferência.
 
     # ===== GRUPOS DE ENTREGAS (mesmo veículo) =====
     if request.delivery_groups:
@@ -1010,12 +1057,12 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.0"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.1"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "11.0"}
+    return {"status": "healthy", "version": "11.1"}
 
 
 # ============== MAIN ==============
