@@ -115,3 +115,38 @@ PR só de frontend (repo `roteirizadorfruleve`, branch `feat/routeeditor-regua-u
 - ⏳ **Pendente pós-publish (Lovable, André):** abrir uma rota no RouteEditor,
   clicar "Atualizar ETA" e conferir que os horários batem com os do board para a
   mesma sequência. Front não tem auto-deploy do Git — precisa do publish.
+
+## PUBLISH + DEPLOY DO FRONT (executado 2026-07-06, missão "fim do gargalo")
+
+**PR #8 PUBLICADO:** squash-merge na main (`8365e1a`) → Lovable sincronizou
+(`get_project.latest_commit_sha` = `8365e1a`) → `deploy_project` via MCP →
+**verificado por hash de conteúdo:** o entry publicado
+(`/assets/index-BExChBsM.js`) tem o MESMO nome content-hashed do build local do
+código do PR #8 (Vite embute o hash do conteúdo no nome — nome igual = build
+idêntico). Não foi suposição.
+
+**Automação de deploy — resultado da investigação (fontes oficiais):**
+- Lovable MCP é **OAuth-only**; doc oficial: "API key authentication is not
+  currently available" → inviável em GitHub Actions/CI headless.
+- API pública do Lovable só cobre "Build with URL" (criar apps novos); **não há
+  endpoint de publish** para projeto existente.
+- **Decisão (regra do André): sem gambiarra frágil.** Publish continua manual-mas-
+  1-comando, documentado no README do front ("Deploy do front"): pedir numa sessão
+  Claude Code → `deploy_project` + verificação de `latest_commit_sha`. Rollback do
+  front também documentado lá (revert na main → sync → republish).
+- **Gate de build criado** (`tsc --noEmit` + testes + `vite build` em todo push/PR
+  na main): arquivo pronto em `.github/workflows-pendente/ci.yml` no repo do front.
+  ⏳ **1 passo do André pra ativar:** mover pra `.github/workflows/ci.yml` (o PAT
+  desta máquina não tem scope `workflow` — GitHub recusa criação de workflow por
+  token sem esse scope). Regra operacional: **CI vermelho na main = não publicar.**
+
+**Smoke pós-publish (caminho real do front):**
+- Edge `recalculate-etas` de produção: viva e **barrando corretamente** requisição
+  sem sessão (401 "Invalid token" — a edge exige JWT de usuário via `auth.getUser`;
+  sem credencial de usuário do roteirizador, e não se cria usuário em prod, o teste
+  autenticado fim-a-fim fica pro primeiro uso real).
+- Motor de produção (mesma URL default `ORTOOLS_API_URL` pra onde a edge encaminha,
+  código da edge intocado pelo PR): `matrix_source: "osrm"` confirmado ao vivo.
+- Elo não exercitado por mim: apenas o pass-through autenticado da edge (código em
+  produção desde antes da v11.2, exercitado diariamente pelo board). Fecha de vez
+  no primeiro "Atualizar ETA" do André no RouteEditor publicado.
