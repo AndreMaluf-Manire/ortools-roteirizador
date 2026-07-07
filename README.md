@@ -51,4 +51,6 @@ python main.py
 ```
 
 Acesse: http://localhost:8000/docs (Swagger UI)
-# v7.6.0
+
+# Versão atual: v11.2
+Changelog completo no docstring do `main.py`. Validações por release em `VALIDACAO_v11.x.md`.

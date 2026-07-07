@@ -2,6 +2,23 @@
 Microserviço de Otimização de Rotas com OR-Tools
 Roteirizador Manirê / Fruleve
 
+VERSÃO 11.2 - RÉGUA ÚNICA DE ETA (/recalculate-etas com OSRM):
+- /recalculate-etas passa a usar OSRM (tempo real de rua, mesmo fator de
+  trânsito) quando OSRM_URL está setada — mesma régua do /optimize.
+  Fallback automático pra Haversine se OSRM falhar/indisponível
+  (= comportamento anterior, nada quebra).
+- Sob OSRM, a velocidade por veículo é IGNORADA no recálculo (igual /optimize:
+  o OSRM já devolve tempo real de carro).
+- Distância reportada também vira estrada real (OSRM) quando disponível.
+- Timeout dedicado curto no recálculo (OSRM_RECALC_TIMEOUT, padrão 6s) +
+  circuit breaker por lote (1ª falha OSRM → Haversine no resto): o salvar da
+  edição no front tem timeout de 10s, OSRM travado não pode travar o salvar.
+- Campo novo matrix_source ("osrm"/"haversine") por rota na resposta (aditivo,
+  não quebra edge/front).
+- Solver, /optimize e regras de negócio INTOCADOS.
+- EFEITO ESPERADO (não é regressão): ETAs de rotas editadas SALTAM uma vez na
+  primeira edição pós-deploy — a régua muda de Haversine 16 km/h pra rua real.
+
 VERSÃO 11.1 - CONSOLIDAÇÃO DE VEÍCULOS (menos carro, mesmas entregas):
 - Custo fixo de veículo real subiu de 500-10k para 100k-150k: abrir carro novo
   agora só compensa quando o atual NÃO comporta (capacidade/janelas). Cada
@@ -47,7 +64,7 @@ import urllib.request
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="11.1"
+    version="11.2"
 )
 
 app.add_middleware(
@@ -114,6 +131,9 @@ PREFERRED_DRIVER_PENALTY = 25_000
 OSRM_URL = os.getenv("OSRM_URL", "").strip()
 OSRM_TRAFFIC_FACTOR = float(os.getenv("OSRM_TRAFFIC_FACTOR", "1.3"))
 OSRM_TIMEOUT = float(os.getenv("OSRM_TIMEOUT", "25"))
+# Timeout dedicado do /recalculate-etas: o salvar da edição no front aborta em 10s,
+# então o OSRM aqui tem que responder rápido ou ceder a vez pro Haversine.
+OSRM_RECALC_TIMEOUT = float(os.getenv("OSRM_RECALC_TIMEOUT", "6"))
 
 # Padrão de saída do depot (minutos) para veículos SEM horário definido. 300 = 05:00.
 GLOBAL_DEFAULT_DEPARTURE = 300
@@ -332,19 +352,20 @@ def scale_matrix(base: List[List[int]], factor: float) -> List[List[int]]:
     return [[int(math.ceil(base[i][j] * factor)) for j in range(n)] for i in range(n)]
 
 
-def fetch_osrm_matrix(locations: List[Location]):
+def fetch_osrm_matrix(locations: List[Location], timeout: Optional[float] = None):
     """
     Via OSRM, retorna (tempos_min, distancias_km) REAIS de carro pela rua:
       - tempos em minutos, já com fator de trânsito;
       - distâncias em km (estrada real), sem fator (distância não muda com trânsito).
     Retorna None se OSRM_URL não estiver setada ou falhar (cai no fallback). INERTE por padrão.
+    timeout: sobrepõe OSRM_TIMEOUT (o /recalculate-etas usa um prazo mais curto).
     """
     if not OSRM_URL:
         return None
     try:
         coords = ";".join(f"{loc.lng},{loc.lat}" for loc in locations)  # OSRM usa lng,lat
         url = f"{OSRM_URL.rstrip('/')}/table/v1/driving/{coords}?annotations=duration,distance"
-        with urllib.request.urlopen(url, timeout=OSRM_TIMEOUT) as resp:
+        with urllib.request.urlopen(url, timeout=timeout or OSRM_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         if data.get("code") != "Ok" or "durations" not in data:
             print(f"  OSRM resposta inesperada: {data.get('code')}")
@@ -974,6 +995,9 @@ class RecalcRouteResult(BaseModel):
     total_time_minutes: int
     start_time: int
     end_time: int
+    # (v11.2) qual régua de tempo foi usada nesta rota: "osrm" ou "haversine".
+    # Campo aditivo — edge e front ignoram sem quebrar.
+    matrix_source: str = "haversine"
 
 
 class RecalcResponse(BaseModel):
@@ -997,6 +1021,9 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
 
     print(f"\n=== RECALCULATE-ETAS ({len(request.routes)} rota(s)) ===")
     result_routes: List[RecalcRouteResult] = []
+    # (v11.2) Circuit breaker do lote: na 1ª falha do OSRM, o resto das rotas vai
+    # direto pro Haversine — sem pagar timeout de novo a cada rota.
+    osrm_down = False
 
     for route in request.routes:
         speed = route.vehicle_speed_kmh or DEFAULT_SPEED_KMH
@@ -1005,14 +1032,41 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
         stop_results: List[RecalcStopResult] = []
         total_distance = 0.0
 
+        # (v11.2) Mesma régua do /optimize: matriz OSRM (depot + paradas com
+        # coordenada, 1 chamada /table por rota). Sob OSRM a velocidade por
+        # veículo é ignorada (o OSRM já dá tempo real de carro — igual /optimize).
+        # Fallback: Haversine + velocidade, comportamento idêntico ao anterior.
+        osrm_time = osrm_dist = None
+        point_idx: Dict[int, int] = {-1: 0}  # -1 = depot; parada i -> índice na matriz
+        if OSRM_URL and not osrm_down:
+            points = [Location(lat=route.depot_lat, lng=route.depot_lng)]
+            for i, s in enumerate(route.stops):
+                if s.lat is not None and s.lng is not None:
+                    point_idx[i] = len(points)
+                    points.append(Location(lat=s.lat, lng=s.lng))
+            if len(points) >= 2:
+                osrm = fetch_osrm_matrix(points, timeout=OSRM_RECALC_TIMEOUT)
+                if osrm:
+                    osrm_time, osrm_dist = osrm
+                else:
+                    osrm_down = True
+        matrix_source = "osrm" if osrm_time else "haversine"
+        print(f"  Rota {route.route_id}: régua {matrix_source}, {len(route.stops)} parada(s)")
+
+        prev_point = -1  # última posição CONHECIDA (índice de parada; -1 = depot)
         for seq, stop in enumerate(route.stops):
             # Parada (ou ponto anterior) sem coordenada: não dá pra medir deslocamento —
             # assume 0 e mantém a última posição conhecida, sem derrubar o lote inteiro.
             if stop.lat is None or stop.lng is None or prev_lat is None or prev_lng is None:
                 dist = 0.0
+                travel_time = 0
+            elif osrm_time:
+                pi, pj = point_idx[prev_point], point_idx[seq]
+                travel_time = osrm_time[pi][pj]
+                dist = osrm_dist[pi][pj] if osrm_dist else haversine_distance(prev_lat, prev_lng, stop.lat, stop.lng)
             else:
                 dist = haversine_distance(prev_lat, prev_lng, stop.lat, stop.lng)
-            travel_time = int(math.ceil((dist / speed) * 60))
+                travel_time = int(math.ceil((dist / speed) * 60))
             arrival_time = current_time + travel_time
 
             wait_time = 0
@@ -1038,17 +1092,21 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
             current_time = departure_time
             if stop.lat is not None and stop.lng is not None:
                 prev_lat, prev_lng = stop.lat, stop.lng
+                prev_point = seq
 
         result_routes.append(RecalcRouteResult(
             route_id=route.route_id, vehicle_id=route.vehicle_id, stops=stop_results,
             total_distance_km=round(total_distance, 1),
             total_time_minutes=current_time - route.start_time,
-            start_time=route.start_time, end_time=current_time
+            start_time=route.start_time, end_time=current_time,
+            matrix_source=matrix_source
         ))
 
     recalc_time = int(time.time() * 1000 - start_ms)
+    n_osrm = sum(1 for r in result_routes if r.matrix_source == "osrm")
     return RecalcResponse(
-        success=True, message=f"{len(result_routes)} rota(s) recalculada(s)",
+        success=True,
+        message=f"{len(result_routes)} rota(s) recalculada(s) ({n_osrm} via OSRM, {len(result_routes) - n_osrm} via Haversine)",
         routes=result_routes, recalc_time_ms=recalc_time
     )
 
@@ -1057,12 +1115,12 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.1"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.2"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "11.1"}
+    return {"status": "healthy", "version": "11.2"}
 
 
 # ============== MAIN ==============
