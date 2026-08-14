@@ -49,8 +49,9 @@ VERSÃO 11.0 - PRECISÃO + ENCAIXA TODOS:
 - Autenticação opcional por segredo compartilhado (só ativa se ORTOOLS_API_KEY existir).
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Set
 from ortools.constraint_solver import routing_enums_pb2
@@ -64,7 +65,7 @@ import urllib.request
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="11.3"
+    version="12.0"
 )
 
 app.add_middleware(
@@ -258,6 +259,13 @@ class OptimizeRequest(BaseModel):
     # Ordem: [depot, ...customers] na MESMA ordem de `customers`.
     time_matrix: Optional[List[List[int]]] = None
     max_route_duration: Optional[int] = None      # informativo por enquanto
+    # (v12.0) Modo assíncrono opcional: se callback_url vier preenchida, o /optimize
+    # responde 202 na hora e roda a otimização em background, entregando o resultado
+    # via POST em callback_url ao final. Sem callback_url: comportamento síncrono
+    # de sempre, intocado.
+    callback_url: Optional[str] = None
+    job_id: Optional[str] = None
+    callback_token: Optional[str] = None
 
 
 class RouteStop(BaseModel):
@@ -504,9 +512,56 @@ def apply_vivenda_rule(
 
 # ============== OTIMIZAÇÃO ==============
 
-@app.post("/optimize", response_model=OptimizeResponse)
-async def optimize_routes(request: OptimizeRequest, authorization: Optional[str] = Header(None)):
+def post_callback(callback_url: str, job_id: str, callback_token: Optional[str], payload: dict):
+    """POST do resultado em callback_url, com retry e backoff (5s/15s/45s)."""
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "x-callback-token": callback_token or "",
+        "x-job-id": job_id or "",
+    }
+    delays = [5, 15, 45]
+    for attempt in range(len(delays) + 1):
+        try:
+            req = urllib.request.Request(callback_url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if 200 <= resp.status < 300:
+                    print(f"  Callback entregue (tentativa {attempt + 1}/{len(delays) + 1}): {resp.status}")
+                    return
+                print(f"  Callback respondeu {resp.status} (tentativa {attempt + 1}/{len(delays) + 1})")
+        except Exception as e:
+            print(f"  Callback falhou (tentativa {attempt + 1}/{len(delays) + 1}): {e}")
+        if attempt < len(delays):
+            time.sleep(delays[attempt])
+    print(f"  Callback esgotou tentativas para job {job_id} ({callback_url})")
+
+
+def run_optimization_and_callback(request: OptimizeRequest):
+    """Roda a otimização em background e entrega o resultado via callback_url."""
+    job_id = request.job_id or ""
+    try:
+        response = run_optimization(request)
+        payload = response.dict()
+    except Exception as e:
+        print(f"  ERRO na otimização em background (job {job_id}): {e}")
+        payload = {"success": False, "message": str(e)}
+    post_callback(request.callback_url, job_id, request.callback_token, payload)
+
+
+@app.post("/optimize", response_model=None)
+async def optimize_routes(
+    request: OptimizeRequest,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None),
+):
     check_api_key(authorization)
+    if request.callback_url:
+        background_tasks.add_task(run_optimization_and_callback, request)
+        return JSONResponse(status_code=202, content={"job_id": request.job_id, "status": "accepted"})
+    return run_optimization(request)
+
+
+def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
     start_time_ms = time.time() * 1000
 
     print(f"\n{'='*60}")
@@ -1119,12 +1174,12 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.3"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "12.0"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "11.3"}
+    return {"status": "healthy", "version": "12.0"}
 
 
 # ============== MAIN ==============
