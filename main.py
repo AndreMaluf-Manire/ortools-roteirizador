@@ -64,7 +64,7 @@ import urllib.request
 app = FastAPI(
     title="OR-Tools Route Optimizer",
     description="API de otimização de rotas para o Roteirizador Manirê",
-    version="11.2"
+    version="11.3"
 )
 
 app.add_middleware(
@@ -96,9 +96,7 @@ DEFAULT_SPEED_KMH = 16.0          # velocidade de referência (base do multiplic
 MAX_TIME_HORIZON = 1440           # 24h em minutos
 DEFAULT_SERVICE_TIME = 15
 PENALTY_UNASSIGNED = 100_000_000_000_000   # 100 trilhões (último recurso: nunca deixar de fora)
-# 150s de GLS: mais consolidação nos dias pesados, com folga contra o timeout de
-# request de 300s do Railway (serialização da resposta + rede ficam fora do limite).
-SOLUTION_TIME_LIMIT = 150
+SOLUTION_TIME_LIMIT = 45  # teto duro, bem abaixo dos 150s de wall clock da Edge Function do Supabase
 
 # Custos fixos por tipo de veículo (quanto menor, mais "barato"/preferido).
 # CALIBRAÇÃO (v11.1) — hierarquia de magnitudes que garante o comportamento:
@@ -820,6 +818,12 @@ async def optimize_routes(request: OptimizeRequest, authorization: Optional[str]
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     search_parameters.time_limit.FromSeconds(SOLUTION_TIME_LIMIT)
+    # Parada por estagnação: sem isso o GUIDED_LOCAL_SEARCH consome o time limit
+    # inteiro mesmo em problemas triviais (3 entregas gastavam 150s), estourando
+    # o wall clock de 150s da Edge Function que chama este endpoint.
+    search_parameters.improvement_limit_parameters.improvement_rate_coefficient = 20.0
+    search_parameters.improvement_limit_parameters.improvement_rate_solutions_distance = 50
+    search_parameters.log_search = False
 
     print(f"\n=== RESOLVENDO (limite: {SOLUTION_TIME_LIMIT}s) ===")
     solution = routing.SolveWithParameters(search_parameters)
@@ -1115,12 +1119,12 @@ async def recalculate_etas(request: RecalcRequest, authorization: Optional[str] 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.2"}
+    return {"status": "ok", "service": "OR-Tools Route Optimizer", "version": "11.3"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "11.2"}
+    return {"status": "healthy", "version": "11.3"}
 
 
 # ============== MAIN ==============
